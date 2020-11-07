@@ -1,0 +1,9 @@
+EESchema-DOCLIB  Version 2.0
+#
+$CMP NodeMCU_ESP12E_Module
+D 32-bit microcontroller module with WiFi
+K ESP8266 WiFi microcontroller
+F https://www.adafruit.com/product/2471
+$ENDCMP
+#
+#End Doc Library
