@@ -610,6 +610,12 @@ void mqttConnect() {
 	char data[200];
 
 	client.setServer(appConfig.MQTTBroker, appConfig.MQTTPort);
+
+	Serial.print(F("MQTT: Connecting to broker "));
+	Serial.print(appConfig.MQTTBroker);
+	Serial.print(F(":"));
+	Serial.println(appConfig.MQTTPort);
+
 	client.setCallback(callback);
 
 	memset(buf, 0, sizeof(buf));
@@ -619,13 +625,13 @@ void mqttConnect() {
 	if(client.connect(buf)) {
 
 		D(F("MQTT: Connected."));
+		Serial.println(F("MQTT: Connected."));
 			
 		happyBlinkTimer = timer.every(HAPPY_PERIOD, blinkLED, (void *)0);
 
 		memset(buf, 0, sizeof(buf));
 		strncpy(buf, systemID, sizeof(buf));
 		strncat(buf, "/notice", sizeof(buf));
-		Serial.println(buf);
 		
 		StaticJsonDocument<200> doc;
 		doc["id"] = systemID;
@@ -633,13 +639,16 @@ void mqttConnect() {
 		serializeJson(doc, data, sizeof(data));
 	
 		if (client.publish(buf, data)) {
+			Serial.println(F("MQTT: SystemID OK."));
 			D(F("MQTT: SystemID OK."));
 			blinkLED((void *)0);
 		}
 		else {
-			D(F("MQTT: SystemID Failed."));
+			Serial.println(F("MQTT: SystemID failed."));
+			D(F("MQTT: SystemID failed."));
 		}
 	} else {
+		Serial.println(F("MQTT: Connect failed."));
 		D(F("MQTT: Connect failed."));
 
 		timer.cancel(happyBlinkTimer);
@@ -680,6 +689,8 @@ void mqttSubscribe() {
 		memset(buf, 0, sizeof(buf));
 		strncpy(buf, systemID, sizeof(buf));
 		strcat(buf, "/+");
+Serial.print("MQTT: Subscribing to ");
+Serial.println(buf);
 		client.subscribe(buf);
 	
 		if(appConfig.temperatureUpdateRate > 0)
@@ -783,6 +794,8 @@ void setup() {
 	mqttConnect();
 
 	mqttSubscribe();
+	
+	Serial.println(F("Ready.\n"));
 }
 
 
@@ -797,7 +810,7 @@ void loop() {
 			timer.cancel(statusTimer);
 
 			D(F("MQTT: Reconnecting..."));
-
+Serial.println("MQTT: Reconnecting...");
 			mqttConnect();
 			mqttSubscribe();
 
