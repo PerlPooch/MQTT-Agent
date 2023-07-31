@@ -10,21 +10,51 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include "DHT.h"
+#include <SoftwareSerial.h>
+#include <DFRobotDFPlayerMini.h>
+#include <MIDI.h>
 
+// ---- Configuration -------------------------------------------------------------------
+//
+#define USE_1WIRE_TEMPERATURE
+// #define USE_DHT11_TEMPERATURE
+#define USE_RELAY_0
+// RELAY_1 and DFPlayer are mutually exclusive
+// #define USE_RELAY_1
+#define USE_STATUS_0
+// STATUS_1 and DFPlayer are mutually exclusive
+// #define USE_STATUS_1
+#define USE_DFPLAYER
+#define PLAY_TRIGGER_RELAY_0
+// #define USE_MIDI
+//
+// --------------------------------------------------------------------------------------
 
-#define VERSION				"1.1"
+#define VERSION				"1.4"
 
 #define SCREEN_WIDTH		128		// OLED display width, in pixels
 #define SCREEN_HEIGHT		32		// OLED display height, in pixels
 #define OLED_RESET    		-1		// Reset pin # (or -1 if sharing Arduino reset pin)
 
+#if defined (USE_RELAY_0) || defined (PLAY_TRIGGER_RELAY_0)
 #define PIN_RELAY_0 		0
+#endif
+#ifdef USE_RELAY_1
 #define PIN_RELAY_1 		2
+#endif
+#define PIN_LED_1			2		// NodeMCU Secondary LED (shares pin with relay!)
+#ifdef USE_STATUS_0
 #define PIN_STATUS_0 		10
+#endif
+#ifdef USE_STATUS_1
 #define PIN_STATUS_1 		13
+#endif
 #define PIN_RESET_WIFI 		12
-#define PIN_ONE_WIRE_BUS 	14
+#define PIN_TEMP_0		 	14
 #define PIN_LED 			16
+
+#define DHT_TYPE			DHT11
 
 #define AUTOCONNECT_MENULABEL_HOME        "Activate"
 
@@ -36,7 +66,9 @@
 #define	DISPLAY_TIMEOUT		5000	// Time(ms) between each display scroll
 #define	DISPLAY_LINES		4		// Number of text lines that fit on the display
 #define	RELAY_TIMEOUT		500 	// Time(ms) for relay pulses
-#define	HAPPY_PERIOD		5000	// Time(ms) for relay pulses
+#define	HAPPY_PERIOD		5000	// Time(ms) for happy LED blinks
+#define	DFPLAYER_RESET		3600	// Time(s) between resetting DFPlayer
+#define ONLINE_CHECK_PERIOD 10000	// Time(ms) between checks to see if we're still online
 
 
 
@@ -45,18 +77,39 @@ char				systemID[32];		// System ID. Based on the WiFi MAC
 ESP8266WebServer 	Server;
 AutoConnect      	Portal(Server);
 
-OneWire 			oneWire(PIN_ONE_WIRE_BUS);
+#ifdef USE_1WIRE_TEMPERATURE
+OneWire 			oneWire(PIN_TEMP_0);
 DallasTemperature 	sensors(&oneWire);
+#endif
+
+#ifdef USE_DHT11_TEMPERATURE
+DHT					dht(PIN_TEMP_0, DHT_TYPE);
+#endif
+
+#ifdef USE_DFPLAYER
+SoftwareSerial mySoftwareSerial(13, 2); // RX, TX  D4, D7
+DFRobotDFPlayerMini dfp;
+#endif
+
+#ifdef USE_MIDI
+SoftwareSerial mySerial(16, 0); // RX, TX  D0, D3
+// MIDI_NAMESPACE::SerialMIDI<SoftwareSerial> serialMIDI(mySerial);
+// MIDI_NAMESPACE::MidiInterface<MIDI_NAMESPACE::SerialMIDI<SoftwareSerial>> MIDI((MIDI_NAMESPACE::SerialMIDI<SoftwareSerial>&)serialMIDI);
+MIDI_CREATE_INSTANCE(SoftwareSerial, mySerial, midiA);
+#endif
 
 WiFiClient 			wifiClient;
 PubSubClient 		client(wifiClient);
 
 Adafruit_SSD1306	display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-Timer<>::Task		happyBlinkTimer;;
+Timer<>::Task		happyBlinkTimer;
 Timer<>::Task		scrollTimer;
 Timer<>::Task		temperatureTimer;
 Timer<>::Task		statusTimer;
+#ifdef USE_DFPLAYER
+Timer<>::Task		dfplayerTimer;
+#endif
 auto				timer = timer_create_default();
 unsigned long		lastMQTTOnlineCheck;
 
@@ -130,6 +183,82 @@ static const char AUX_mqtt_setting[] PROGMEM = R"raw(
 ]
 )raw";
 
+
+#ifdef USE_DFPLAYER
+void dfpPrintDetail(uint8_t type, int value) {
+	switch (type) {
+		case TimeOut:
+			Serial.println(F("DFP: Timeout."));
+			break;
+		case WrongStack:
+			Serial.println(F("DFP: Stack Wrong."));
+			break;
+		case DFPlayerCardInserted:
+			Serial.println(F("DFP: Card Inserted."));
+			D(F("Card Inserted."));
+			break;
+		case DFPlayerCardRemoved:
+			Serial.println(F("DFP: Card Removed."));
+			D(F("Card Removed."));
+			break;
+		case DFPlayerCardOnline:
+			Serial.println(F("DFP: Card Online."));
+			D(F("Card Online."));
+			break;
+		case DFPlayerUSBInserted:
+			Serial.println("DFP: USB Inserted.");
+			break;
+		case DFPlayerUSBRemoved:
+			Serial.println("DFP: USB Removed.");
+			break;
+		case DFPlayerPlayFinished:
+			Serial.print(F("DFP: Number:"));
+			Serial.print(value);
+			Serial.println(F(" Play Finished."));
+			D("Play " + String(value) + " finished.");
+#ifdef PLAY_TRIGGER_RELAY_0
+			delay(200);
+			digitalWrite(PIN_RELAY_0, 0);
+#endif
+#ifdef USE_MIDI
+			midiA.sendNoteOff(61, 0, 1);     // Stop the note
+#endif
+			publishPlayStatus((void *)0, value, "complete");
+		break;
+		case DFPlayerError:
+			Serial.print(F("DFP: Error, "));
+
+			switch (value) {
+				case Busy:
+					Serial.println(F("Card not found"));
+					break;
+				case Sleeping:
+					Serial.println(F("Sleeping"));
+					break;
+				case SerialWrongStack:
+					Serial.println(F("Get Wrong Stack"));
+					break;
+				case CheckSumNotMatch:
+					Serial.println(F("Check Sum Not Match"));
+					break;
+				case FileIndexOut:
+					Serial.println(F("File Index Out of Bound"));
+					break;
+				case FileMismatch:
+					Serial.println(F("Cannot Find File"));
+					break;
+				case Advertise:
+					Serial.println(F("In Advertise"));
+					break;
+				default:
+					break;
+			}
+			break;
+		default:
+			break;
+	}  
+}
+#endif
 
 void printFile(const char *filename) {
 	File file = SPIFFS.open(filename, "r");
@@ -227,24 +356,51 @@ bool clearRelay(void* opaque) {
 	size_t relayNum = (size_t)opaque;
 
 	byte relay;
+#ifdef USE_RELAY_0
 	if(relayNum == 0) relay = PIN_RELAY_0;
+#endif
+#ifdef USE_RELAY_1
 	if(relayNum == 1) relay = PIN_RELAY_1;
+#endif
 
-	digitalWrite(relay, 0);
+//	digitalWrite(relay, 0);
 	return false; // repeat?
 }
 
 
 String updateTemperature() {
-	sensors.requestTemperatures(); // Send the command to get temperatures
-	
-	float 	temp = sensors.getTempFByIndex(0);
+	float 	temp;
 	char	data[200];
+
+#ifdef USE_1WIRE_TEMPERATURE
+	sensors.requestTemperatures(); // Send the command to get temperatures
+	temp = sensors.getTempFByIndex(0);
+#elif defined(USE_DHT11_TEMPERATURE)
+	temp = dht.readTemperature(1);
+#else
+	temp = 0.0f;
+#endif
 
 	snprintf(data, sizeof(data), "%0.1f", temp);
 
 	return String(data);
 }
+
+
+String updateHumidity() {
+	float 	humidity;
+	char	data[200];
+
+#if defined(USE_DHT11_TEMPERATURE)
+	humidity = dht.readHumidity();
+#else
+	humidity = 0.0f;
+#endif
+	snprintf(data, sizeof(data), "%0.1f", humidity);
+
+	return String(data);
+}
+
 
 bool publishTemperature(void* opaque) {
 	char	data[200];
@@ -254,7 +410,8 @@ bool publishTemperature(void* opaque) {
 	D(String(F("Temp 0: ")) + temp);
 
 	memset(buf, 0, sizeof(buf));
-	strncpy(buf, systemID, sizeof(buf));
+	strncpy(buf, "spencer/", sizeof(buf));
+	strcat(buf, systemID);
 	strcat(buf, "/temperature");
 	
 	blinkLED((void *)0);
@@ -264,6 +421,39 @@ bool publishTemperature(void* opaque) {
 	doc["id"] = systemID;
 	doc["temperature"] = temp;
 	doc["updateRate"] = (String)appConfig.temperatureUpdateRate;
+
+	serializeJson(doc, data, sizeof(data));
+	
+	if (client.publish(buf, data)) {
+	}
+	
+#ifdef USE_DHT11_TEMPERATURE
+	publishHumidity(0);
+#endif
+	
+	return true;
+}
+
+
+bool publishHumidity(void* opaque) {
+	char	data[200];
+	char	buf[64];
+
+	String temp = updateHumidity();
+	D(String(F("Humd 0: ")) + temp);
+
+	memset(buf, 0, sizeof(buf));
+	strncpy(buf, "spencer/", sizeof(buf));
+	strcat(buf, systemID);
+	strcat(buf, "/humidity");
+	
+	blinkLED((void *)0);
+	
+	StaticJsonDocument<200> doc;
+
+	doc["id"] = systemID;
+	doc["humidity"] = temp;
+	doc["updateRate"] = (String)appConfig.temperatureUpdateRate; // Note we copy this
 
 	serializeJson(doc, data, sizeof(data));
 	
@@ -281,26 +471,46 @@ bool publishStatus(void* opaque) {
 	bool	input0 = false;
 	bool	input1 = false;
 
+#ifdef USE_STATUS_0
 	input0 = ! digitalRead(PIN_STATUS_0);
+#endif
+#ifdef USE_STATUS_1
 	input1 = ! digitalRead(PIN_STATUS_1);
+#endif
 
 	D(String(F("Status: ")) + String(input0) + String(F(" ")) + String(input1));
 
 	memset(buf, 0, sizeof(buf));
-	strncpy(buf, systemID, sizeof(buf));
+	strncpy(buf, "spencer/", sizeof(buf));
+	strcat(buf, systemID);
 	strcat(buf, "/status");
 	
 	blinkLED((void *)0);
 	
-	StaticJsonDocument<200> doc;
+// 	StaticJsonDocument<200> doc;
+// 
+// 	if (WiFi.status() == WL_CONNECTED) {
+// 		long rssi = WiFi.RSSI();
+// //		D(String(F("RSSI: ")) + String(rssi) + String(F(" dBm")));
+// //		D("IP: " + WiFi.localIP().toString());
+// 
+// 		doc["rssi"] = String(rssi);
+// 		doc["ip"] = WiFi.localIP().toString();
+// 	}
+// 
+// 	doc["id"] = systemID;
+// #ifdef USE_STATUS_0
+// 	doc["status0"] = (String)input0;
+// #endif
+// #ifdef USE_STATUS_1
+// 	doc["status1"] = (String)input1;
+// #endif
+// 	doc["updateRate"] = (String)appConfig.statusUpdateRate;
+// 
+// //  	serializeJsonPretty(doc, Serial);
+// //  	Serial.println();
 
-	doc["id"] = systemID;
-	doc["status0"] = (String)input0;
-	doc["status1"] = (String)input1;
-	doc["updateRate"] = (String)appConfig.statusUpdateRate;
-
-//  	serializeJsonPretty(doc, Serial);
-//  	Serial.println();
+	DynamicJsonDocument doc = getStatusAsJSON();
 
 	serializeJson(doc, data, sizeof(data));
 	
@@ -315,13 +525,22 @@ bool publishRelays(void* opaque) {
 	char	data[200];
 	char	buf[64];
 
+#ifdef USE_RELAY_0
 	bool relay0 = digitalRead(PIN_RELAY_0);
+#else
+	bool relay0 = false;
+#endif
+#ifdef USE_RELAY_1
 	bool relay1 = digitalRead(PIN_RELAY_1);
+#else
+	bool relay1 = false;
+#endif
 
 	D(String(F("Relays: ")) + String(relay0) + String(F(" ")) + String(relay1));
 
 	memset(buf, 0, sizeof(buf));
-	strncpy(buf, systemID, sizeof(buf));
+	strncpy(buf, "spencer/", sizeof(buf));
+	strcat(buf, systemID);
 	strcat(buf, "/relay");
 	
 	blinkLED((void *)0);
@@ -329,9 +548,12 @@ bool publishRelays(void* opaque) {
 	StaticJsonDocument<200> doc;
 
 	doc["id"] = systemID;
+#ifdef USE_RELAY_0
 	doc["relay0"] = (String)relay0;
+#endif
+#ifdef USE_RELAY_1
 	doc["relay1"] = (String)relay1;
-
+#endif
 	serializeJson(doc, data, sizeof(data));
 	
 	if (client.publish(buf, data)) {
@@ -341,6 +563,35 @@ bool publishRelays(void* opaque) {
 }
 
 
+bool publishPlayStatus(void* opaque, int item, String status) {
+	char	data[200];
+	char	buf[64];
+
+	memset(buf, 0, sizeof(buf));
+	strncpy(buf, "spencer/", sizeof(buf));
+	strcat(buf, systemID);
+	strcat(buf, "/trigger");
+	
+	blinkLED((void *)0);
+	
+	StaticJsonDocument<200> doc;
+
+	doc["id"] = systemID;
+	doc["item"] = (String)item;
+	doc["status"] = (String)status;
+	
+	serializeJson(doc, data, sizeof(data));
+	
+	if (client.publish(buf, data)) {
+	}
+	
+	return true;
+}
+
+
+// This is called any time an MQTT message matches our subscription. Since we subscribe to the same
+// topics we publish, this will be called every time we publish, too. So, we bail as early as we can
+// (no command).
 void callback(char* in_topic, byte* in_message, unsigned int length) {
 	String	message;
 	char*	token;
@@ -354,6 +605,7 @@ void callback(char* in_topic, byte* in_message, unsigned int length) {
 	strncpy(buf, (char*)in_message, length);
 	buf[length] = 0;
 	message = String(buf);
+	Serial.println("t: " + String(in_topic));
 	Serial.println("m: " + message);
 
 	StaticJsonDocument<512> doc;
@@ -366,19 +618,6 @@ void callback(char* in_topic, byte* in_message, unsigned int length) {
 		return;
 	}
 
-	// Parse the topic into parts.
-	// we use systemID/<device>
-	const char delimeter[2] = "/";
-
-	// Since we only subscribed to topics matching our systemID, we don't need to check it here.
-	token = strtok(in_topic, delimeter);
-	Serial.println("1: " + String(token));
-
-	// Now get the device
-	token = strtok(NULL, delimeter);
-	device = String(token);
-	Serial.println("2: " + device);
-
 	// --- Command ---
 	jsonValue = doc["command"];
 	command = String(jsonValue);
@@ -387,10 +626,29 @@ void callback(char* in_topic, byte* in_message, unsigned int length) {
 		return;
 	}
 	Serial.println("Command: " + command);
+
+	// Parse the topic into parts.
+	// we use spencer/systemID/<device>
+	const char delimeter[2] = "/";
+
+	// Spencer prefix
+	token = strtok(in_topic, delimeter);
+	Serial.println("1: " + String(token));
+
+	// Since we only subscribed to topics matching our systemID, we don't need to check it here.
+	token = strtok(NULL, delimeter);
+	Serial.println("2: " + String(token));
+
+	// Now get the device
+	token = strtok(NULL, delimeter);
+	device = String(token);
+	Serial.println("3: " + device);
+
  
  	if(command == "fetch") {
 	 	if(device == "temperature") {
 			publishTemperature((void *)0);
+			publishHumidity((void *)0);
 		} else if(device == "status") {
 			publishStatus((void *)0);
 		} else if(device == "relay") {
@@ -432,14 +690,22 @@ void callback(char* in_topic, byte* in_message, unsigned int length) {
 			return;
 		}
 		if(state.length() == 0) {
-			Serial.println("state");
+			Serial.println("state missing");
 			return;
 		}
  	
 	 	if(device == "relay") {
 			byte relay;
+#ifdef USE_RELAY_0
 			if(deviceNum.toInt() == 0) relay = PIN_RELAY_0;
+#else
+			if(deviceNum.toInt() == 0) return;
+#endif
+#ifdef USE_RELAY_1
 			if(deviceNum.toInt() == 1) relay = PIN_RELAY_1;
+#else
+			if(deviceNum.toInt() == 1) return;
+#endif
 			if(deviceNum.toInt() > 1) return;
 			
 			if(state == "on") {
@@ -460,43 +726,105 @@ void callback(char* in_topic, byte* in_message, unsigned int length) {
 				timer.in(RELAY_TIMEOUT, clearRelay, (void *)deviceNum.toInt());
 			}
 		}
+ 	} else if(command == "play") {
+		jsonValue = doc["item"];
+		String item = String(jsonValue);
+
+		if(item.length() == 0) {
+			Serial.println("item missing");
+			return;
+		}
+ 	
+#ifdef USE_DFPLAYER
+ 		D("Play item " + item);
+#ifdef USE_MIDI
+		midiA.sendNoteOn(61, 127, 1);    // Send a Note (pitch 42, velo 127 on channel 1)
+#endif
+#ifdef PLAY_TRIGGER_RELAY_0
+		digitalWrite(PIN_RELAY_0, 1);
+#endif
+#if defined (PLAY_TRIGGER_RELAY_0) || defined (USE_MIDI)
+		delay(200);
+#endif
+//		dfp.play(item.toInt());
+		dfp.playFolder(01, (byte)item.toInt());
+		
+#endif
 	}
 }
 
 
 
 
-void rootPage() {
+DynamicJsonDocument getStatusAsJSON() {
 	char	buff[10];
-	char	data[200];
 
-	StaticJsonDocument<200> doc;
+	DynamicJsonDocument doc(400);
 
+	doc["version"] = String(VERSION);
+
+	if (WiFi.status() == WL_CONNECTED) {
+		long rssi = WiFi.RSSI();
+
+		doc["rssi"] = String(rssi);
+		doc["ip"] = WiFi.localIP().toString();
+		doc["id"] = systemID;
+	}
+
+#ifdef USE_STATUS_0
 	bool	input0 = ! digitalRead(PIN_STATUS_0);
+#endif
+#ifdef USE_STATUS_1
 	bool	input1 = ! digitalRead(PIN_STATUS_1);
+#endif
+#ifdef USE_RELAY_0
 	bool 	relay0 = digitalRead(PIN_RELAY_0);
+#endif
+#ifdef USE_RELAY_1
 	bool	relay1 = digitalRead(PIN_RELAY_1);
+#endif
+#if defined (USE_DHT11_TEMPERATURE) || defined (USE_1WIRE_TEMPERATURE)
 	String	temp = updateTemperature();
-
-	doc["status0"] = (String)input0;
-	doc["status1"] = (String)input1;
-	doc["relay0"] = (String)relay0;
-	doc["relay1"] = (String)relay1;	
 	doc["temperature"] = temp;
 	doc["temperatureUpdateRate"] = (String)appConfig.temperatureUpdateRate;
+#endif
+#ifdef USE_STATUS_0
+	doc["status0"] = (String)input0;
+#endif
+#ifdef USE_STATUS_1
+	doc["status1"] = (String)input1;
+#endif
+#ifdef USE_RELAY_0
+	doc["relay0"] = (String)relay0;
+#endif
+#ifdef USE_RELAY_1
+	doc["relay1"] = (String)relay1;	
+#endif
+
 	doc["statusUpdateRate"] = (String)appConfig.statusUpdateRate;
 	doc["broker"] = (String)appConfig.MQTTBroker;
 	doc["brokerPort"] = (String)appConfig.MQTTPort;
+#if defined(USE_DHT11_TEMPERATURE)
+	String	humid = updateHumidity();
+	doc["humidity"] = humid;
+#endif
 
-	serializeJsonPretty(doc, Serial);
-	Serial.println();
-
-	serializeJson(doc, data, sizeof(data));
-
-	Server.send(200, "application/json", data);
+	return doc;
 }
 
 
+void rootPage() {
+	char	data[400];
+
+	DynamicJsonDocument doc = getStatusAsJSON();
+	
+	serializeJsonPretty(doc, Serial);
+	Serial.println();
+
+	serializeJsonPretty(doc, data, sizeof(data));
+
+	Server.send(200, "application/json", data);
+}
 
 
 bool clearMessage(void* opaque) 
@@ -541,7 +869,7 @@ void D(String m)
 
 void setupSystem()
 {
-	// Compute the systemID -- The unique ID for this devicd. This will be used as the root leaf
+	// Compute the systemID -- The unique ID for this device. This will be used as the root leaf
 	// for the MQTT topic
 	String mac = WiFi.macAddress();
 	mac.getBytes((byte *)systemID, sizeof(systemID));
@@ -571,20 +899,55 @@ void setupDisplay()
 }
 
 
+void setupDFP() {
+#ifdef USE_DFPLAYER
+	D(F("DFP: Initializing..."));
+	Serial.println(F("DFP: Initializing..."));
+
+	mySoftwareSerial.begin(9600);
+  
+	if (!dfp.begin(mySoftwareSerial, false, true)) {
+	    Serial.println(F("DFP: Error, unable to communicate."));
+	    Serial.println(F("Fatal."));
+
+		while(true){
+			delay(0); // Code to compatible with ESP8266 watch dog.
+		}
+	}
+	D(F("DFP: Online."));
+	Serial.println(F("DFP: Online."));
+
+	dfp.volume(30);  //Set volume value. From 0 to 30
+
+	dfplayerTimer = timer.every(DFPLAYER_RESET * 1000, dfpReset, (void *)0);
+#endif
+}
+
+
 void welcome() {
 	display.clearDisplay();
 
 	display.setCursor(0,0);
 
+	for(int i = 0; i < 3; i++) {
+		digitalWrite(PIN_LED, 0);
+		delay(50);
+		digitalWrite(PIN_LED, 1);
+		delay(300);
+	}
+
 	display.print(F("MQTT Agent, V"));
 	display.println(VERSION); 
 	display.println(); 
-	display.println(F("(C) 2020")); 
+	display.println(F("(C) 2022"));
 	display.println(F("Marc D. Spencer")); 
 
 	display.display();
 
+	digitalWrite(PIN_LED, 0);
 	delay(5000);
+	digitalWrite(PIN_LED, 1);
+
 	display.clearDisplay();
 	display.display();
 }
@@ -592,7 +955,7 @@ void welcome() {
 
 bool clearLED(void* opaque) {
 	digitalWrite(PIN_LED, 1);
-	
+
 	return false;
 } 
 
@@ -604,6 +967,12 @@ bool blinkLED(void* opaque) {
 	return true;
 }
 
+#ifdef USE_DFPLAYER
+bool dfpReset(void* opaque) {
+	dfp.reset();	
+	return true;
+}
+#endif
 
 void mqttConnect() {
 	char buf[32];
@@ -623,14 +992,20 @@ void mqttConnect() {
 	strncat(buf, systemID, sizeof(buf));
 
 	if(client.connect(buf)) {
-
 		D(F("MQTT: Connected."));
+
+		if (WiFi.status() == WL_CONNECTED) {
+			long rssi = WiFi.RSSI();
+			D(String(F("RSSI: ")) + String(rssi) + String(F(" dBm")));
+		}
+
 		Serial.println(F("MQTT: Connected."));
 			
 		happyBlinkTimer = timer.every(HAPPY_PERIOD, blinkLED, (void *)0);
 
 		memset(buf, 0, sizeof(buf));
-		strncpy(buf, systemID, sizeof(buf));
+		strncpy(buf, "spencer/", sizeof(buf));
+		strncat(buf, systemID, sizeof(buf));
 		strncat(buf, "/notice", sizeof(buf));
 		
 		StaticJsonDocument<200> doc;
@@ -649,6 +1024,12 @@ void mqttConnect() {
 		}
 	} else {
 		Serial.println(F("MQTT: Connect failed."));
+
+		if (WiFi.status() == WL_CONNECTED) {
+			long rssi = WiFi.RSSI();
+			D(String(F("RSSI: ")) + String(rssi) + String(F(" dBm")));
+		}
+
 		D(F("MQTT: Connect failed."));
 
 		timer.cancel(happyBlinkTimer);
@@ -661,36 +1042,14 @@ void mqttSubscribe() {
 	if(client.connected()) {
 		char buf[32];
 
-		//  client.subscribe((String((char *)topic) + "/relay/0").c_str());
-// 		memset(buf, 0, sizeof(buf));
-// 		strncpy(buf, systemID, sizeof(buf));
-// 		strcat(buf, "/relay/0");
-// 		client.subscribe(buf);
-// 
-// 		memset(buf, 0, sizeof(buf));
-// 		strncpy(buf, systemID, sizeof(buf));
-// 		strcat(buf, "/relay/1");
-// 		client.subscribe(buf);
-// 
-// 		memset(buf, 0, sizeof(buf));
-// 		strncpy(buf, systemID, sizeof(buf));
-// 		strcat(buf, "/temperature/0");
-// 		client.subscribe(buf);
-// 	
-// 		memset(buf, 0, sizeof(buf));
-// 		strncpy(buf, systemID, sizeof(buf));
-// 		strcat(buf, "/status/0");
-// 		client.subscribe(buf);
-// 	
-// 		memset(buf, 0, sizeof(buf));
-// 		strncpy(buf, systemID, sizeof(buf));
-// 		strcat(buf, "/status/1");
-// 		client.subscribe(buf);
 		memset(buf, 0, sizeof(buf));
-		strncpy(buf, systemID, sizeof(buf));
+		strncpy(buf, "spencer/", sizeof(buf));
+		strcat(buf, systemID);
 		strcat(buf, "/+");
-Serial.print("MQTT: Subscribing to ");
-Serial.println(buf);
+
+		Serial.print("MQTT: Subscribing to ");
+		Serial.println(buf);
+
 		client.subscribe(buf);
 	
 		if(appConfig.temperatureUpdateRate > 0)
@@ -719,22 +1078,89 @@ void setup() {
 	pinMode(PIN_RESET_WIFI, INPUT_PULLUP);
 	is_reset = digitalRead(PIN_RESET_WIFI);
 
+#ifdef USE_STATUS_0
 	pinMode(PIN_STATUS_0, INPUT_PULLUP);
+#endif
+#ifdef USE_STATUS_1
 	pinMode(PIN_STATUS_1, INPUT_PULLUP);
+#endif
 
 	pinMode(PIN_LED, OUTPUT);
 	digitalWrite(PIN_LED, 1);
 
+#if defined (USE_RELAY_0) || defined (PLAY_TRIGGER_RELAY_0)
 	pinMode(PIN_RELAY_0, OUTPUT);
 	digitalWrite(PIN_RELAY_0, 0);
+#endif
 
+#ifdef USE_RELAY_1
 	pinMode(PIN_RELAY_1, OUTPUT);
 	digitalWrite(PIN_RELAY_1, 0);
+#else
+ 	pinMode(PIN_LED_1, OUTPUT);
+ 	digitalWrite(PIN_LED_1, 1);		// PIN_RELAY_1 controls the secondary LED on the NodeMCU, so we force it off.
+#endif
+
+#ifdef USE_DHT11_TEMPERATURE
+	dht.begin();
+#endif
+
 
 	Serial.begin(115200);
 	Serial.println();
 
+	Serial.println(F("\n\n"));
+
 	welcome();
+
+#ifdef USE_DHT11_TEMPERATURE
+	Serial.println(F("Config: DHT11 Temperature enabled"));
+	Serial.println(F("Config:   Temperature sensor enabled"));
+	Serial.println(F("Config:   Humidity sensor enabled"));
+#else
+	Serial.println(F("Config: DHT11 Temperature disabled"));
+#endif
+#ifdef USE_1WIRE_TEMPERATURE
+	Serial.println(F("Config: 1-Wire Temperature enabled"));
+	Serial.println(F("Config:   Temperature sensor enabled"));
+#else
+	Serial.println(F("Config: 1-Wire Temperature disabled"));
+#endif
+#ifdef USE_RELAY_0
+	Serial.println(F("Config: Relay 0 enabled"));
+#else
+	Serial.println(F("Config: Relay 0 disabled"));
+#endif
+#ifdef USE_RELAY_1
+	Serial.println(F("Config: Relay 1 enabled"));
+#else
+	Serial.println(F("Config: Relay 1 disabled"));
+#endif
+#ifdef USE_STATUS_0
+	Serial.println(F("Config: Status 0 enabled"));
+#else
+	Serial.println(F("Config: Status 0 disabled"));
+#endif
+#ifdef USE_STATUS_1
+	Serial.println(F("Config: Status 1 enabled"));
+#else
+	Serial.println(F("Config: Status 1 disabled"));
+#endif
+#ifdef USE_DFPLAYER
+	Serial.println(F("Config: DFPlayer enabled"));
+#ifdef PLAY_TRIGGER_RELAY_0
+	Serial.println(F("Config: Play triggers Relay 0"));
+#endif
+#else
+	Serial.println(F("Config: DFPlayer disabled"));
+#endif
+#ifdef USE_MIDI
+	Serial.println(F("Config: MIDI enabled"));
+#else
+	Serial.println(F("Config: MIDI disabled"));
+#endif
+
+	Serial.println();
 
 	// Should load default config if run for the first time
 	Serial.println(F("Loading configuration..."));
@@ -757,7 +1183,7 @@ void setup() {
 	acConfig.ota = AC_OTA_BUILTIN;
 	acConfig.title = String(systemID);
 	acConfig.homeUri = "/";
-	acConfig.menuItems = AC_MENUITEM_CONFIGNEW | AC_MENUITEM_DISCONNECT | AC_MENUITEM_RESET;
+	acConfig.menuItems = AC_MENUITEM_CONFIGNEW | AC_MENUITEM_DISCONNECT | AC_MENUITEM_RESET | AC_MENUITEM_UPDATE;
 
 	if(Portal.load(FPSTR(AUX_mqtt_setting))) {
 		AutoConnectAux& mqtt_setting = *Portal.aux(AUX_SETTING_URI);
@@ -791,6 +1217,14 @@ void setup() {
 	if (is_reset == LOW)
 		return;
 
+#ifdef USE_DFPLAYER
+	setupDFP();
+#endif
+
+#ifdef USE_MIDI
+	midiA.begin(1);	// Launch MIDI and listen to channel 1
+#endif
+   
 	mqttConnect();
 
 	mqttSubscribe();
@@ -810,18 +1244,32 @@ void loop() {
 			timer.cancel(statusTimer);
 
 			D(F("MQTT: Reconnecting..."));
-Serial.println("MQTT: Reconnecting...");
+			Serial.println("MQTT: Reconnecting...");
 			mqttConnect();
 			mqttSubscribe();
 
-			lastMQTTOnlineCheck = millis() + 30000;
+			lastMQTTOnlineCheck = millis() + ONLINE_CHECK_PERIOD;
 		}
 	}
-	
+
+#ifdef USE_DFPLAYER
+	if (dfp.available()) {
+		dfpPrintDetail(dfp.readType(), dfp.read());
+	}
+#endif
+
 	timer.tick();
 	
+#ifdef USE_STATUS_0
 	bool status0 = ! digitalRead(PIN_STATUS_0);
+#else
+	bool status0 = false;
+#endif
+#ifdef USE_STATUS_1
 	bool status1 = ! digitalRead(PIN_STATUS_1);
+#else
+	bool status1 = false;
+#endif
 
 	if((status0 != lastStatus0) || (status1 != lastStatus1)) {
 		publishStatus((void *)0);
