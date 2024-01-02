@@ -21,21 +21,25 @@
 // #define USE_DHT11_TEMPERATURE
 #define USE_RELAY_0
 // RELAY_1 and DFPlayer are mutually exclusive
-// #define USE_RELAY_1
+#define USE_RELAY_1
 #define USE_STATUS_0
 // STATUS_1 and DFPlayer are mutually exclusive
-// #define USE_STATUS_1
-#define USE_DFPLAYER
-#define PLAY_TRIGGER_RELAY_0
+#define USE_STATUS_1
+// #define USE_DFPLAYER
+// #define PLAY_TRIGGER_RELAY_0
 // #define USE_MIDI
+// #define RELAY_POSITIVE_LOGIC
+#define RELAY_NEGATIVE_LOGIC
 //
 // --------------------------------------------------------------------------------------
 
-#define VERSION				"1.4"
+#define VERSION				"1.6"
+
 
 #define SCREEN_WIDTH		128		// OLED display width, in pixels
 #define SCREEN_HEIGHT		32		// OLED display height, in pixels
 #define OLED_RESET    		-1		// Reset pin # (or -1 if sharing Arduino reset pin)
+// #define DEBUG_D						// Mirror screen to serial
 
 #if defined (USE_RELAY_0) || defined (PLAY_TRIGGER_RELAY_0)
 #define PIN_RELAY_0 		0
@@ -56,21 +60,31 @@
 
 #define DHT_TYPE			DHT11
 
+#undef AUTOCONNECT_MENULABEL_HOME
 #define AUTOCONNECT_MENULABEL_HOME        "Activate"
+#define AC_USE_SPIFFS
 
 #define CONFIG_FILE			"/config.json"
 #define AUX_SETTING_URI		"/mqtt_setting"
 #define AUX_SAVE_URI		"/mqtt_save"
 #define AUX_CLEAR_URI		"/mqtt_clear"
 
+
 #define	DISPLAY_TIMEOUT		5000	// Time(ms) between each display scroll
 #define	DISPLAY_LINES		4		// Number of text lines that fit on the display
 #define	RELAY_TIMEOUT		500 	// Time(ms) for relay pulses
 #define	HAPPY_PERIOD		5000	// Time(ms) for happy LED blinks
+#define	HAPPY_NOMQTT_PERIOD	10000	// Time(ms) for happy LED blinks
 #define	DFPLAYER_RESET		3600	// Time(s) between resetting DFPlayer
 #define ONLINE_CHECK_PERIOD 10000	// Time(ms) between checks to see if we're still online
 
-
+#ifdef RELAY_POSITIVE_LOGIC
+#define LOGIC_HIGH 1
+#define LOGIC_LOW 0
+#else
+#define LOGIC_HIGH 0
+#define LOGIC_LOW 1
+#endif
 
 char				systemID[32];		// System ID. Based on the WiFi MAC
 
@@ -127,6 +141,7 @@ struct Screen {
 Screen screen;
 
 bool lastStatus0, lastStatus1;
+bool reset_is_down = false;
 
 static const char AUX_mqtt_setting[] PROGMEM = R"raw(
 [
@@ -218,7 +233,7 @@ void dfpPrintDetail(uint8_t type, int value) {
 			D("Play " + String(value) + " finished.");
 #ifdef PLAY_TRIGGER_RELAY_0
 			delay(200);
-			digitalWrite(PIN_RELAY_0, 0);
+			digitalWrite(PIN_RELAY_0, LOGIC_LOW);
 #endif
 #ifdef USE_MIDI
 			midiA.sendNoteOff(61, 0, 1);     // Stop the note
@@ -275,8 +290,22 @@ void printFile(const char *filename) {
 	file.close();
 }
 
+void listDir(fs::FS &fs, const char *dirname){
+	Serial.printf("  Directory %s:\n", dirname);
 
-void loadConfiguration(const char *filename, AppConfig &config) {
+	String str = "";
+	Dir dir = fs.openDir(dirname);
+	while (dir.next()) {
+		str += F("    ");
+		str += dir.fileName();
+		str += F(" (");
+		str += dir.fileSize();
+		str += F("b)\n");
+	}
+	Serial.print(str);
+}
+
+bool loadConfiguration(const char *filename, AppConfig &config) {
 	File file = SPIFFS.open(filename, "r");
 
 	if (file) {
@@ -284,9 +313,11 @@ void loadConfiguration(const char *filename, AppConfig &config) {
 
 		DeserializationError error = deserializeJson(doc, file);
 
-		if (error)
+		if (error) {
 			Serial.println(F("Unable to read configuration"));
-		else {
+			file.close();
+			return false;
+		} else {
 			strlcpy(config.MQTTBroker, doc["MQTTBroker"], sizeof(config.MQTTBroker));
 
 			config.MQTTPort = doc["MQTTPort"];
@@ -299,8 +330,10 @@ void loadConfiguration(const char *filename, AppConfig &config) {
 		} 
 
 		file.close();
+		return true;
 	} else {
 		Serial.println(F("Unable to open configuration."));
+		return false;
 	}
 }
 
@@ -363,7 +396,7 @@ bool clearRelay(void* opaque) {
 	if(relayNum == 1) relay = PIN_RELAY_1;
 #endif
 
-//	digitalWrite(relay, 0);
+	digitalWrite(relay, LOGIC_LOW);
 	return false; // repeat?
 }
 
@@ -416,20 +449,22 @@ bool publishTemperature(void* opaque) {
 	
 	blinkLED((void *)0);
 	
-	StaticJsonDocument<200> doc;
+	if(strlen(appConfig.MQTTBroker) > 0) {
+		StaticJsonDocument<200> doc;
 
-	doc["id"] = systemID;
-	doc["temperature"] = temp;
-	doc["updateRate"] = (String)appConfig.temperatureUpdateRate;
+		doc["id"] = systemID;
+		doc["temperature"] = temp;
+		doc["updateRate"] = (String)appConfig.temperatureUpdateRate;
 
-	serializeJson(doc, data, sizeof(data));
+		serializeJson(doc, data, sizeof(data));
 	
-	if (client.publish(buf, data)) {
-	}
+		if (client.publish(buf, data)) {
+		}
 	
 #ifdef USE_DHT11_TEMPERATURE
-	publishHumidity(0);
+		publishHumidity(0);
 #endif
+	}
 	
 	return true;
 }
@@ -449,17 +484,19 @@ bool publishHumidity(void* opaque) {
 	
 	blinkLED((void *)0);
 	
-	StaticJsonDocument<200> doc;
+	if(strlen(appConfig.MQTTBroker) > 0) {
+		StaticJsonDocument<200> doc;
 
-	doc["id"] = systemID;
-	doc["humidity"] = temp;
-	doc["updateRate"] = (String)appConfig.temperatureUpdateRate; // Note we copy this
+		doc["id"] = systemID;
+		doc["humidity"] = temp;
+		doc["updateRate"] = (String)appConfig.temperatureUpdateRate; // Note we copy this
 
-	serializeJson(doc, data, sizeof(data));
+		serializeJson(doc, data, sizeof(data));
 	
-	if (client.publish(buf, data)) {
+		if (client.publish(buf, data)) {
+		}
 	}
-	
+		
 	return true;
 }
 
@@ -510,13 +547,15 @@ bool publishStatus(void* opaque) {
 // //  	serializeJsonPretty(doc, Serial);
 // //  	Serial.println();
 
-	DynamicJsonDocument doc = getStatusAsJSON();
+	if(strlen(appConfig.MQTTBroker) > 0) {
+		DynamicJsonDocument doc = getStatusAsJSON();
 
-	serializeJson(doc, data, sizeof(data));
+		serializeJson(doc, data, sizeof(data));
 	
-	if (client.publish(buf, data)) {
+		if (client.publish(buf, data)) {
+		}
 	}
-	
+		
 	return true;
 }
 
@@ -535,6 +574,11 @@ bool publishRelays(void* opaque) {
 #else
 	bool relay1 = false;
 #endif
+#ifdef USE_POSITIVE_LOGIC
+#else
+	relay0 = !relay0;
+	relay1 = !relay1;
+#endif
 
 	D(String(F("Relays: ")) + String(relay0) + String(F(" ")) + String(relay1));
 
@@ -545,18 +589,20 @@ bool publishRelays(void* opaque) {
 	
 	blinkLED((void *)0);
 	
-	StaticJsonDocument<200> doc;
+	if(strlen(appConfig.MQTTBroker) > 0) {
+		StaticJsonDocument<200> doc;
 
-	doc["id"] = systemID;
+		doc["id"] = systemID;
 #ifdef USE_RELAY_0
-	doc["relay0"] = (String)relay0;
+		doc["relay0"] = (String)relay0;
 #endif
 #ifdef USE_RELAY_1
-	doc["relay1"] = (String)relay1;
+		doc["relay1"] = (String)relay1;
 #endif
-	serializeJson(doc, data, sizeof(data));
+		serializeJson(doc, data, sizeof(data));
 	
-	if (client.publish(buf, data)) {
+		if (client.publish(buf, data)) {
+		}
 	}
 	
 	return true;
@@ -574,17 +620,19 @@ bool publishPlayStatus(void* opaque, int item, String status) {
 	
 	blinkLED((void *)0);
 	
-	StaticJsonDocument<200> doc;
+	if(strlen(appConfig.MQTTBroker) > 0) {
+		StaticJsonDocument<200> doc;
 
-	doc["id"] = systemID;
-	doc["item"] = (String)item;
-	doc["status"] = (String)status;
+		doc["id"] = systemID;
+		doc["item"] = (String)item;
+		doc["status"] = (String)status;
 	
-	serializeJson(doc, data, sizeof(data));
+		serializeJson(doc, data, sizeof(data));
 	
-	if (client.publish(buf, data)) {
+		if (client.publish(buf, data)) {
+		}
 	}
-	
+		
 	return true;
 }
 
@@ -712,17 +760,17 @@ void callback(char* in_topic, byte* in_message, unsigned int length) {
 				blinkLED((void *)0);
 				D("Set Relay " + deviceNum + " On");
 
-				digitalWrite(relay, 1);
+				digitalWrite(relay, LOGIC_HIGH);
 			} else if(state == "off") {
 				blinkLED((void *)0);
 				D("Set Relay " + deviceNum + " Off");
 
-				digitalWrite(relay, 0);
+				digitalWrite(relay, LOGIC_LOW);
 			} else if(state == "pulse") {
 				blinkLED((void *)0);
 				D("Set Relay " + deviceNum + " Pulse");
 
-				digitalWrite(relay, 1);
+				digitalWrite(relay, LOGIC_HIGH);
 				timer.in(RELAY_TIMEOUT, clearRelay, (void *)deviceNum.toInt());
 			}
 		}
@@ -741,7 +789,7 @@ void callback(char* in_topic, byte* in_message, unsigned int length) {
 		midiA.sendNoteOn(61, 127, 1);    // Send a Note (pitch 42, velo 127 on channel 1)
 #endif
 #ifdef PLAY_TRIGGER_RELAY_0
-		digitalWrite(PIN_RELAY_0, 1);
+		digitalWrite(PIN_RELAY_0, LOGIC_HIGH);
 #endif
 #if defined (PLAY_TRIGGER_RELAY_0) || defined (USE_MIDI)
 		delay(200);
@@ -758,6 +806,7 @@ void callback(char* in_topic, byte* in_message, unsigned int length) {
 
 DynamicJsonDocument getStatusAsJSON() {
 	char	buff[10];
+	String	config;
 
 	DynamicJsonDocument doc(400);
 
@@ -773,15 +822,41 @@ DynamicJsonDocument getStatusAsJSON() {
 
 #ifdef USE_STATUS_0
 	bool	input0 = ! digitalRead(PIN_STATUS_0);
+	config += "I0 ";
 #endif
 #ifdef USE_STATUS_1
 	bool	input1 = ! digitalRead(PIN_STATUS_1);
+	config += "I1 ";
 #endif
 #ifdef USE_RELAY_0
 	bool 	relay0 = digitalRead(PIN_RELAY_0);
+	config += "R0 ";
 #endif
 #ifdef USE_RELAY_1
 	bool	relay1 = digitalRead(PIN_RELAY_1);
+	config += "R1 ";
+#endif
+#ifdef RELAY_POSITIVE_LOGIC
+	config += "R+ ";
+#else
+	config += "R- ";
+	relay0 = !relay0;
+	relay1 = !relay1;
+#endif
+#if defined (USE_DHT11_TEMPERATURE)
+	config += "TD ";
+#endif
+#if defined (USE_1WIRE_TEMPERATURE)
+	config += "T1 ";
+#endif
+#if defined (USE_DFPLAYER)
+	config += "DF ";
+#endif
+#if defined (PLAY_TRIGGER_RELAY_0)
+	config += "PT ";
+#endif
+#if defined (USE_MIDI)
+	config += "Md ";
 #endif
 #if defined (USE_DHT11_TEMPERATURE) || defined (USE_1WIRE_TEMPERATURE)
 	String	temp = updateTemperature();
@@ -808,6 +883,8 @@ DynamicJsonDocument getStatusAsJSON() {
 	String	humid = updateHumidity();
 	doc["humidity"] = humid;
 #endif
+	config.trim();
+	doc["config"] = config;
 
 	return doc;
 }
@@ -816,7 +893,63 @@ DynamicJsonDocument getStatusAsJSON() {
 void rootPage() {
 	char	data[400];
 
+	if(Server.hasArg(F("statusUpdateRate"))) {
+		appConfig.statusUpdateRate = Server.arg(F("statusUpdateRate")).toInt();
+		D("Set-rate Status: " + String(appConfig.statusUpdateRate));
+		saveConfiguration(CONFIG_FILE, appConfig);
+		timer.cancel(statusTimer);
+		if(appConfig.statusUpdateRate > 0)
+			statusTimer = timer.every(appConfig.statusUpdateRate * 1000, publishStatus, (void *)0);
+	}
+
+	if(Server.hasArg(F("temperatureUpdateRate"))) {
+		appConfig.temperatureUpdateRate = Server.arg(F("temperatureUpdateRate")).toInt();
+		D("Set-rate Temp: " + String(appConfig.temperatureUpdateRate));
+		saveConfiguration(CONFIG_FILE, appConfig);
+		timer.cancel(temperatureTimer);
+		if(appConfig.temperatureUpdateRate > 0)
+			temperatureTimer = timer.every(appConfig.temperatureUpdateRate * 1000, publishTemperature, (void *)0);
+	}	
+	
+	if(Server.hasArg(F("set"))) {
+		String state = Server.arg(F("state"));
+		String deviceNum = Server.arg(F("device-num"));
+
+		byte relay;
+#ifdef USE_RELAY_0
+		if(deviceNum.toInt() == 0) relay = PIN_RELAY_0;
+#else
+		if(deviceNum.toInt() == 0) return;
+#endif
+#ifdef USE_RELAY_1
+		if(deviceNum.toInt() == 1) relay = PIN_RELAY_1;
+#else
+		if(deviceNum.toInt() == 1) return;
+#endif
+		if(deviceNum.toInt() > 1) return;
+
+			if(state == "on") {
+				blinkLED((void *)0);
+				D("Set Relay " + deviceNum + " On");
+
+				digitalWrite(relay, LOGIC_HIGH);
+			} else if(state == "off") {
+				blinkLED((void *)0);
+				D("Set Relay " + deviceNum + " Off");
+
+				digitalWrite(relay, LOGIC_LOW);
+			} else if(state == "pulse") {
+				blinkLED((void *)0);
+				D("Set Relay " + deviceNum + " Pulse");
+
+				digitalWrite(relay, LOGIC_HIGH);
+				timer.in(RELAY_TIMEOUT, clearRelay, (void *)deviceNum.toInt());
+			}
+	}	
+	
 	DynamicJsonDocument doc = getStatusAsJSON();
+
+	blinkLED((void *)0);
 	
 	serializeJsonPretty(doc, Serial);
 	Serial.println();
@@ -834,7 +967,7 @@ bool clearMessage(void* opaque)
 	return true;
 }
 
-bool clearDisplay() 
+void clearDisplay() 
 {
 	display.clearDisplay();
 	display.setCursor(0,0);
@@ -851,6 +984,10 @@ void D(String m)
 	}
 	screen.lines[DISPLAY_LINES-1] = m;
 	
+#ifdef DEBUG_D
+	Serial.println("D: " + m);
+#endif
+
 	display.clearDisplay();
 	display.setCursor(0,0);
 	
@@ -988,8 +1125,8 @@ void mqttConnect() {
 	client.setCallback(callback);
 
 	memset(buf, 0, sizeof(buf));
-	strncpy(buf, "MQTT-Agent-", sizeof(buf));
-	strncat(buf, systemID, sizeof(buf));
+	strncpy(buf, "MQTT-Agent-", sizeof(buf)-1);
+	strncat(buf, systemID, sizeof(buf)-1);
 
 	if(client.connect(buf)) {
 		D(F("MQTT: Connected."));
@@ -1004,9 +1141,9 @@ void mqttConnect() {
 		happyBlinkTimer = timer.every(HAPPY_PERIOD, blinkLED, (void *)0);
 
 		memset(buf, 0, sizeof(buf));
-		strncpy(buf, "spencer/", sizeof(buf));
-		strncat(buf, systemID, sizeof(buf));
-		strncat(buf, "/notice", sizeof(buf));
+		strncpy(buf, "spencer/", sizeof(buf)-1);
+		strncat(buf, systemID, sizeof(buf)-1);
+		strncat(buf, "/notice", sizeof(buf)-1);
 		
 		StaticJsonDocument<200> doc;
 		doc["id"] = systemID;
@@ -1069,9 +1206,6 @@ void setup() {
 
 	int is_reset = 0;
 
-	SPIFFS.begin();
-	
-	AutoConnectConfig acConfig;
 
 	delay(1000);
 
@@ -1090,12 +1224,12 @@ void setup() {
 
 #if defined (USE_RELAY_0) || defined (PLAY_TRIGGER_RELAY_0)
 	pinMode(PIN_RELAY_0, OUTPUT);
-	digitalWrite(PIN_RELAY_0, 0);
+	digitalWrite(PIN_RELAY_0, LOGIC_LOW);
 #endif
 
 #ifdef USE_RELAY_1
 	pinMode(PIN_RELAY_1, OUTPUT);
-	digitalWrite(PIN_RELAY_1, 0);
+	digitalWrite(PIN_RELAY_1, LOGIC_LOW);
 #else
  	pinMode(PIN_LED_1, OUTPUT);
  	digitalWrite(PIN_LED_1, 1);		// PIN_RELAY_1 controls the secondary LED on the NodeMCU, so we force it off.
@@ -1109,7 +1243,19 @@ void setup() {
 	Serial.begin(115200);
 	Serial.println();
 
+	Serial.print(F("\n"));
+	Serial.print(F(VERSION));
 	Serial.println(F("\n\n"));
+
+	if(!SPIFFS.begin()) {
+		Serial.println(F("SPIFFS: Mount Failed"));
+		return;
+	} else {
+		Serial.println(F("SPIFFS: OK"));
+		listDir(SPIFFS, "/");
+	}
+
+	AutoConnectConfig acConfig;
 
 	welcome();
 
@@ -1125,6 +1271,11 @@ void setup() {
 	Serial.println(F("Config:   Temperature sensor enabled"));
 #else
 	Serial.println(F("Config: 1-Wire Temperature disabled"));
+#endif
+#ifdef RELAY_POSITIVE_LOGIC
+	Serial.println(F("Config: Relay positive logic"));
+#else
+	Serial.println(F("Config: Relay negative logic"));
 #endif
 #ifdef USE_RELAY_0
 	Serial.println(F("Config: Relay 0 enabled"));
@@ -1164,15 +1315,15 @@ void setup() {
 
 	// Should load default config if run for the first time
 	Serial.println(F("Loading configuration..."));
-	loadConfiguration(CONFIG_FILE, appConfig);
-
-	// Create configuration file
-// 	Serial.println(F("Saving configuration..."));
-// 	saveConfiguration(CONFIG_FILE, appConfig);
+	if(! loadConfiguration(CONFIG_FILE, appConfig)) {
+		Serial.println(F("Saving default configuration..."));
+	 	saveConfiguration(CONFIG_FILE, appConfig);
+	}
+	Serial.println(F("Done."));
 
 	// Dump config file
-	Serial.println(F("Print config file..."));
-	printFile(CONFIG_FILE);
+// 	Serial.println(F("Print config file..."));
+// 	printFile(CONFIG_FILE);
 
 
 	Server.on("/", rootPage);
@@ -1199,7 +1350,18 @@ void setup() {
 		Serial.println("load error");
 	}
 
+	if(SPIFFS.exists("/ac_credt")) {
+		Portal.restoreCredential("/ac_credt", SPIFFS);
+	} else {
+		D(F("WiFi AP Configuration"));
+		D("");
+		D(String(acConfig.apid));
+		D("PW: " + String(acConfig.psk));
+    }
+
 	if (is_reset == LOW) {
+		SPIFFS.remove("/ac_credt");
+
 		D(F("WiFi AP Configuration"));
 		D("");
 		D(String(acConfig.apid));
@@ -1211,7 +1373,9 @@ void setup() {
 	Portal.config(acConfig);
 
 	if (Portal.begin()) {  
+		Portal.saveCredential("/ac_credt", SPIFFS);
 		D("IP: " + WiFi.localIP().toString());
+	} else {
 	}
 
 	if (is_reset == LOW)
@@ -1225,9 +1389,16 @@ void setup() {
 	midiA.begin(1);	// Launch MIDI and listen to channel 1
 #endif
    
-	mqttConnect();
+	if(strlen(appConfig.MQTTBroker) > 0) {
+		mqttConnect();
 
-	mqttSubscribe();
+		mqttSubscribe();
+	} else {
+		D(F("MQTT: Unconfigured."));
+		Serial.println(F("MQTT: Unconfigured.\n"));
+
+		happyBlinkTimer = timer.every(HAPPY_NOMQTT_PERIOD, blinkLED, (void *)0);
+	}
 	
 	Serial.println(F("Ready.\n"));
 }
@@ -1237,7 +1408,7 @@ void loop() {
 	Portal.handleClient();
 
 	bool isConnected = client.loop();
-	if(! isConnected) {
+	if((strlen(appConfig.MQTTBroker) > 0) && ! isConnected) {
 		if(millis() > lastMQTTOnlineCheck) {
 			timer.cancel(happyBlinkTimer);
 			timer.cancel(temperatureTimer);
@@ -1259,6 +1430,17 @@ void loop() {
 #endif
 
 	timer.tick();
+	
+	bool is_reset = digitalRead(PIN_RESET_WIFI);
+	if(!is_reset && !reset_is_down) {
+		reset_is_down = true;
+		D("IP: " + WiFi.localIP().toString());
+		Serial.println("IP: " + WiFi.localIP().toString());
+	}
+	is_reset = digitalRead(PIN_RESET_WIFI);
+	if(is_reset && reset_is_down) {
+		reset_is_down = false;
+	}
 	
 #ifdef USE_STATUS_0
 	bool status0 = ! digitalRead(PIN_STATUS_0);
