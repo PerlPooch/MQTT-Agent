@@ -32,6 +32,7 @@ class MDS_Display {
 
 	private:
 		Adafruit_SSD1306	display;
+		bool				isSetup = false;
 		Screen				screen;
 		unsigned long		nextClearTime;
 };

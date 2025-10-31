@@ -1,30 +1,13 @@
-#include <ESP8266WiFi.h>
-#include <ESP8266WebServer.h>
-#include <AutoConnect.h>
-#include <PubSubClient.h>
-#include <OneWire.h>
-#include <DallasTemperature.h>
-#include <arduino-timer.h>
-#include <FS.h>
-#include <SPI.h>
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
-#include "DHT.h"
-#include <SoftwareSerial.h>
-#include <DFRobotDFPlayerMini.h>
-#include <MIDI.h>
-
 // ---- Configuration -------------------------------------------------------------------
 //
-#define USE_1WIRE_TEMPERATURE
-// #define USE_DHT11_TEMPERATURE
-#define USE_RELAY_0
+// #define USE_1WIRE_TEMPERATURE
+#define USE_DHT11_TEMPERATURE
+// #define USE_RELAY_0
 // RELAY_1 and DFPlayer are mutually exclusive
-#define USE_RELAY_1
-#define USE_STATUS_0
+// #define USE_RELAY_1
+// #define USE_STATUS_0
 // STATUS_1 and DFPlayer are mutually exclusive
-#define USE_STATUS_1
+// #define USE_STATUS_1
 // #define USE_DFPLAYER
 // #define PLAY_TRIGGER_RELAY_0
 // #define USE_MIDI
@@ -32,6 +15,33 @@
 #define RELAY_NEGATIVE_LOGIC
 //
 // --------------------------------------------------------------------------------------
+
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <AutoConnect.h>
+#include <PubSubClient.h>
+#ifdef USE_1WIRE_TEMPERATURE
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#endif
+#include <arduino-timer.h>
+#include <FS.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#ifdef USE_DHT11_TEMPERATURE
+#include "DHT.h"
+#endif
+#ifdef USE_DFPLAYER
+#include <SoftwareSerial.h>
+#include <DFRobotDFPlayerMini.h>
+#endif
+#ifdef USE_MIDI
+#include <MIDI.h>
+#endif
+
+
 
 #define VERSION				"1.6"
 
@@ -502,7 +512,7 @@ bool publishHumidity(void* opaque) {
 
 
 bool publishStatus(void* opaque) {
-	char	data[200];
+	char	data[400];
 	char	buf[64];
 
 	bool	input0 = false;
@@ -524,34 +534,11 @@ bool publishStatus(void* opaque) {
 	
 	blinkLED((void *)0);
 	
-// 	StaticJsonDocument<200> doc;
-// 
-// 	if (WiFi.status() == WL_CONNECTED) {
-// 		long rssi = WiFi.RSSI();
-// //		D(String(F("RSSI: ")) + String(rssi) + String(F(" dBm")));
-// //		D("IP: " + WiFi.localIP().toString());
-// 
-// 		doc["rssi"] = String(rssi);
-// 		doc["ip"] = WiFi.localIP().toString();
-// 	}
-// 
-// 	doc["id"] = systemID;
-// #ifdef USE_STATUS_0
-// 	doc["status0"] = (String)input0;
-// #endif
-// #ifdef USE_STATUS_1
-// 	doc["status1"] = (String)input1;
-// #endif
-// 	doc["updateRate"] = (String)appConfig.statusUpdateRate;
-// 
-// //  	serializeJsonPretty(doc, Serial);
-// //  	Serial.println();
-
 	if(strlen(appConfig.MQTTBroker) > 0) {
 		DynamicJsonDocument doc = getStatusAsJSON();
 
 		serializeJson(doc, data, sizeof(data));
-	
+
 		if (client.publish(buf, data)) {
 		}
 	}
@@ -643,7 +630,7 @@ bool publishPlayStatus(void* opaque, int item, String status) {
 void callback(char* in_topic, byte* in_message, unsigned int length) {
 	String	message;
 	char*	token;
-	char	buf[64];
+	char	buf[512];
 
 	String	device;
 	String	command;
@@ -840,8 +827,12 @@ DynamicJsonDocument getStatusAsJSON() {
 	config += "R+ ";
 #else
 	config += "R- ";
+#ifdef USE_RELAY_0
 	relay0 = !relay0;
+#endif
+#ifdef USE_RELAY_1
 	relay1 = !relay1;
+#endif
 #endif
 #if defined (USE_DHT11_TEMPERATURE)
 	config += "TD ";
@@ -1076,7 +1067,7 @@ void welcome() {
 	display.print(F("MQTT Agent, V"));
 	display.println(VERSION); 
 	display.println(); 
-	display.println(F("(C) 2022"));
+	display.println(F("(C) 2024"));
 	display.println(F("Marc D. Spencer")); 
 
 	display.display();
@@ -1123,6 +1114,7 @@ void mqttConnect() {
 	Serial.println(appConfig.MQTTPort);
 
 	client.setCallback(callback);
+	client.setBufferSize(512);
 
 	memset(buf, 0, sizeof(buf));
 	strncpy(buf, "MQTT-Agent-", sizeof(buf)-1);
@@ -1201,27 +1193,6 @@ void mqttSubscribe() {
 
 
 void setup() {
-	setupSystem();
-	setupDisplay();
-
-	int is_reset = 0;
-
-
-	delay(1000);
-
-	pinMode(PIN_RESET_WIFI, INPUT_PULLUP);
-	is_reset = digitalRead(PIN_RESET_WIFI);
-
-#ifdef USE_STATUS_0
-	pinMode(PIN_STATUS_0, INPUT_PULLUP);
-#endif
-#ifdef USE_STATUS_1
-	pinMode(PIN_STATUS_1, INPUT_PULLUP);
-#endif
-
-	pinMode(PIN_LED, OUTPUT);
-	digitalWrite(PIN_LED, 1);
-
 #if defined (USE_RELAY_0) || defined (PLAY_TRIGGER_RELAY_0)
 	pinMode(PIN_RELAY_0, OUTPUT);
 	digitalWrite(PIN_RELAY_0, LOGIC_LOW);
@@ -1234,6 +1205,28 @@ void setup() {
  	pinMode(PIN_LED_1, OUTPUT);
  	digitalWrite(PIN_LED_1, 1);		// PIN_RELAY_1 controls the secondary LED on the NodeMCU, so we force it off.
 #endif
+
+#ifdef USE_STATUS_0
+	pinMode(PIN_STATUS_0, INPUT_PULLUP);
+#endif
+#ifdef USE_STATUS_1
+	pinMode(PIN_STATUS_1, INPUT_PULLUP);
+#endif
+
+	pinMode(PIN_LED, OUTPUT);
+	digitalWrite(PIN_LED, 1);
+
+	setupSystem();
+	setupDisplay();
+
+	int is_reset = 0;
+
+
+	delay(1000);
+
+	pinMode(PIN_RESET_WIFI, INPUT_PULLUP);
+	is_reset = digitalRead(PIN_RESET_WIFI);
+
 
 #ifdef USE_DHT11_TEMPERATURE
 	dht.begin();
@@ -1435,6 +1428,7 @@ void loop() {
 	if(!is_reset && !reset_is_down) {
 		reset_is_down = true;
 		D("IP: " + WiFi.localIP().toString());
+		D("ID: " + String(systemID));
 		Serial.println("IP: " + WiFi.localIP().toString());
 	}
 	is_reset = digitalRead(PIN_RESET_WIFI);
