@@ -1,18 +1,18 @@
 // ---- Configuration -------------------------------------------------------------------
 //
-// #define USE_1WIRE_TEMPERATURE
-#define USE_DHT11_TEMPERATURE
+#define USE_1WIRE_TEMPERATURE
+// #define USE_DHT11_TEMPERATURE
 // #define USE_RELAY_0
 // RELAY_1 and DFPlayer are mutually exclusive
 // #define USE_RELAY_1
-// #define USE_STATUS_0
+#define USE_STATUS_0
 // STATUS_1 and DFPlayer are mutually exclusive
-// #define USE_STATUS_1
+#define USE_STATUS_1
 // #define USE_DFPLAYER
 // #define PLAY_TRIGGER_RELAY_0
 // #define USE_MIDI
 // #define RELAY_POSITIVE_LOGIC
-#define RELAY_NEGATIVE_LOGIC
+// #define RELAY_NEGATIVE_LOGIC
 //
 // --------------------------------------------------------------------------------------
 
@@ -43,7 +43,7 @@
 
 
 
-#define VERSION				"1.6"
+#define VERSION				"1.7"
 
 
 #define SCREEN_WIDTH		128		// OLED display width, in pixels
@@ -87,6 +87,7 @@
 #define	HAPPY_NOMQTT_PERIOD	10000	// Time(ms) for happy LED blinks
 #define	DFPLAYER_RESET		3600	// Time(s) between resetting DFPlayer
 #define ONLINE_CHECK_PERIOD 10000	// Time(ms) between checks to see if we're still online
+#define REBOOT_DAYS			7		// Reboot every N days
 
 #ifdef RELAY_POSITIVE_LOGIC
 #define LOGIC_HIGH 1
@@ -95,6 +96,8 @@
 #define LOGIC_HIGH 0
 #define LOGIC_LOW 1
 #endif
+
+#define MS_PER_DAY			(24UL * 60UL * 60UL * 1000UL)
 
 char				systemID[32];		// System ID. Based on the WiFi MAC
 
@@ -136,6 +139,8 @@ Timer<>::Task		dfplayerTimer;
 #endif
 auto				timer = timer_create_default();
 unsigned long		lastMQTTOnlineCheck;
+static const uint32_t
+					rebootTime = (uint32_t)((uint32_t)REBOOT_DAYS * MS_PER_DAY);
 
 struct AppConfig {
 	char		MQTTBroker[64];
@@ -449,6 +454,8 @@ bool publishTemperature(void* opaque) {
 	char	data[200];
 	char	buf[64];
 
+// Serial.println(F("publishTemperature()"));
+
 	String temp = updateTemperature();
 	D(String(F("Temp 0: ")) + temp);
 
@@ -483,6 +490,8 @@ bool publishTemperature(void* opaque) {
 bool publishHumidity(void* opaque) {
 	char	data[200];
 	char	buf[64];
+
+// Serial.println(F("publishHumidity()"));
 
 	String temp = updateHumidity();
 	D(String(F("Humd 0: ")) + temp);
@@ -876,6 +885,7 @@ DynamicJsonDocument getStatusAsJSON() {
 #endif
 	config.trim();
 	doc["config"] = config;
+	doc["uptime"] = (String)millis();
 
 	return doc;
 }
@@ -1103,7 +1113,7 @@ bool dfpReset(void* opaque) {
 #endif
 
 void mqttConnect() {
-	char buf[32];
+	char buf[64];
 	char data[200];
 
 	client.setServer(appConfig.MQTTBroker, appConfig.MQTTPort);
@@ -1122,13 +1132,12 @@ void mqttConnect() {
 
 	if(client.connect(buf)) {
 		D(F("MQTT: Connected."));
+		Serial.println(F("MQTT: Connected ") + String(buf));
 
 		if (WiFi.status() == WL_CONNECTED) {
 			long rssi = WiFi.RSSI();
 			D(String(F("RSSI: ")) + String(rssi) + String(F(" dBm")));
 		}
-
-		Serial.println(F("MQTT: Connected."));
 			
 		happyBlinkTimer = timer.every(HAPPY_PERIOD, blinkLED, (void *)0);
 
@@ -1143,8 +1152,8 @@ void mqttConnect() {
 		serializeJson(doc, data, sizeof(data));
 	
 		if (client.publish(buf, data)) {
-			Serial.println(F("MQTT: SystemID OK."));
-			D(F("MQTT: SystemID OK."));
+			Serial.println(F("MQTT: Online."));
+			D(F("MQTT: Online."));
 			blinkLED((void *)0);
 		}
 		else {
@@ -1180,7 +1189,7 @@ void mqttSubscribe() {
 		Serial.println(buf);
 
 		client.subscribe(buf);
-	
+
 		if(appConfig.temperatureUpdateRate > 0)
 			temperatureTimer = timer.every(appConfig.temperatureUpdateRate * 1000, publishTemperature, (void *)0);
 
@@ -1188,6 +1197,7 @@ void mqttSubscribe() {
 			statusTimer = timer.every(appConfig.statusUpdateRate * 1000, publishStatus, (void *)0);
 	} else {
 		D(F("MQTT: Not connected."));
+		Serial.println(F("MQTT: Subscribe failed. Not connected."));
 	}
 }
 
@@ -1230,6 +1240,9 @@ void setup() {
 
 #ifdef USE_DHT11_TEMPERATURE
 	dht.begin();
+#endif
+#ifdef USE_1WIRE_TEMPERATURE
+	sensors.begin();
 #endif
 
 
@@ -1368,6 +1381,7 @@ void setup() {
 	if (Portal.begin()) {  
 		Portal.saveCredential("/ac_credt", SPIFFS);
 		D("IP: " + WiFi.localIP().toString());
+		Serial.println(F("IP: ") + WiFi.localIP().toString() + F("\n"));
 	} else {
 	}
 
@@ -1375,10 +1389,12 @@ void setup() {
 		return;
 
 #ifdef USE_DFPLAYER
+	Serial.println(F("DFP: Setup."));
 	setupDFP();
 #endif
 
 #ifdef USE_MIDI
+	Serial.println(F("Midi: Setup."));
 	midiA.begin(1);	// Launch MIDI and listen to channel 1
 #endif
    
@@ -1398,7 +1414,16 @@ void setup() {
 
 
 void loop() {
-	Portal.handleClient();
+	if (millis() >= rebootTime) {
+		D(F("Rebooting ..."));
+		Serial.println("Rebooting ...");
+
+		delay(3000);
+
+		ESP.restart();
+	}
+	
+  	Portal.handleClient();
 
 	bool isConnected = client.loop();
 	if((strlen(appConfig.MQTTBroker) > 0) && ! isConnected) {
