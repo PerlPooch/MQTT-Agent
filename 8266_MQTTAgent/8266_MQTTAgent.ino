@@ -405,18 +405,23 @@ String saveMQTTParams(AutoConnectAux& aux, PageArgument& args) {
 
 
 bool clearRelay(void* opaque) {
-	size_t relayNum = (size_t)opaque;
-
-	byte relay;
-#ifdef USE_RELAY_0
-	if(relayNum == 0) relay = PIN_RELAY_0;
+	const size_t relayNum = (size_t)(uintptr_t)opaque;
+	
+	int relayPin = -1;
+	
+#if defined(USE_RELAY_0)
+	if(relayNum == 0) relayPin = PIN_RELAY_0;
 #endif
-#ifdef USE_RELAY_1
-	if(relayNum == 1) relay = PIN_RELAY_1;
+#if defined(USE_RELAY_1)
+	if(relayNum == 1) relayPin = PIN_RELAY_1;
 #endif
-
-	digitalWrite(relay, LOGIC_LOW);
-	return false; // repeat?
+	
+	if(relayPin < 0) {		// Unknown relayNum or relay not compiled in
+		return false;
+	}
+	
+	digitalWrite(relayPin, LOGIC_LOW);
+	return false; // one-shot for SimpleTimer-style callbacks
 }
 
 
@@ -594,10 +599,10 @@ bool publishRelays(void* opaque) {
 
 		doc["id"] = systemID;
 #ifdef USE_RELAY_0
-		doc["relay0"] = (String)relay0;
+		doc["relay0"] = (uint8_t)(relay0 ? 1 : 0);
 #endif
 #ifdef USE_RELAY_1
-		doc["relay1"] = (String)relay1;
+		doc["relay1"] = (uint8_t)(relay1 ? 1 : 0);
 #endif
 		serializeJson(doc, data, sizeof(data));
 	
