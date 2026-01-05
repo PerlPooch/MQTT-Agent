@@ -681,7 +681,8 @@ void callback(char* in_topic, byte* in_message, unsigned int length) {
 	//		{"command": "play", "item": "1-indexed int-as-string"}
 	
 	// Valid: fetch|set-rate|set|play
-	jsonValue = doc["command"];
+	jsonValue = doc["command"] | "";
+	if (!*jsonValue) return;
 	command = String(jsonValue);
 
 	if(command.length() == 0) {
@@ -712,8 +713,10 @@ void callback(char* in_topic, byte* in_message, unsigned int length) {
 	device = String(token);
 // 	Serial.println("3: " + device);
 
-	Serial.print(F("MQTT: Device: ") + device);
-	Serial.println(F(", Command: ") + command);
+	Serial.print(F("MQTT: Device: "));
+	Serial.print(device);
+	Serial.print(F(", Command: "));
+	Serial.println(command);
 
   	if(command == "fetch") {
 	 	if(device == "temperature") {
@@ -725,7 +728,8 @@ void callback(char* in_topic, byte* in_message, unsigned int length) {
 			publishRelays((void *)0);
 		}
  	} else if(command == "set-rate") {
-		jsonValue = doc["rate"];
+		jsonValue = doc["rate"] | "";
+		if (!*jsonValue) return;
 		String rate = String(jsonValue);
 
 		if(rate.length() == 0) {
@@ -749,10 +753,12 @@ void callback(char* in_topic, byte* in_message, unsigned int length) {
  				statusTimer = timer.every(appConfig.statusUpdateRate * 1000, publishStatus, (void *)0);
 		}
  	} else if(command == "set") {
-		jsonValue = doc["device-num"];
+		jsonValue = doc["device-num"] | "";
+		if (!*jsonValue) return;
 		String deviceNum = String(jsonValue);
 
-		jsonValue = doc["state"];
+		jsonValue = doc["state"] | "";
+		if (!*jsonValue) return;
 		String state = String(jsonValue);
 
 		if(deviceNum.length() == 0) {
@@ -797,7 +803,7 @@ void callback(char* in_topic, byte* in_message, unsigned int length) {
 			}
 		}
  	} else if(command == "play") {
-		jsonValue = doc["item"];
+		jsonValue = doc["item"] | "";;
 		String item = String(jsonValue);
 
 		if(item.length() == 0) {
@@ -838,7 +844,7 @@ DynamicJsonDocument getStatusAsJSON() {
 	if (WiFi.status() == WL_CONNECTED) {
 		long rssi = WiFi.RSSI();
 
-		doc["rssi"] = String(rssi);
+		doc["rssi"] = rssi;
 		doc["ip"] = WiFi.localIP().toString();
 		doc["id"] = systemID;
 	}
@@ -891,16 +897,16 @@ DynamicJsonDocument getStatusAsJSON() {
 	doc["temperatureUpdateRate"] = (String)appConfig.temperatureUpdateRate;
 #endif
 #ifdef USE_STATUS_0
-	doc["status0"] = (String)input0;
+	doc["status0"] = (uint8_t)(input0 ? 1 : 0);
 #endif
 #ifdef USE_STATUS_1
-	doc["status1"] = (String)input1;
+	doc["status1"] = (uint8_t)(input1 ? 1 : 0);
 #endif
 #ifdef USE_RELAY_0
-	doc["relay0"] = (String)relay0;
+	doc["relay0"] = (uint8_t)(relay0 ? 1 : 0);
 #endif
 #ifdef USE_RELAY_1
-	doc["relay1"] = (String)relay1;	
+	doc["relay1"] = (uint8_t)(relay1 ? 1 : 0);
 #endif
 
 	doc["statusUpdateRate"] = (String)appConfig.statusUpdateRate;
@@ -912,7 +918,7 @@ DynamicJsonDocument getStatusAsJSON() {
 #endif
 	config.trim();
 	doc["config"] = config;
-	doc["uptime"] = (String)millis();
+	doc["uptime"] = millis();
 
 	return doc;
 }
@@ -1037,7 +1043,9 @@ void setupSystem()
 	// Compute the systemID -- The unique ID for this device. This will be used as the root leaf
 	// for the MQTT topic
 	String mac = WiFi.macAddress();
-	mac.getBytes((byte *)systemID, sizeof(systemID));
+	mac.toUpperCase();
+	mac.toCharArray(systemID, sizeof(systemID));
+	systemID[sizeof(systemID) - 1] = '\0';
 }
 
 
