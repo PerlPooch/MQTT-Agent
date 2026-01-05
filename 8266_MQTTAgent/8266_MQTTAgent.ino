@@ -1,16 +1,16 @@
 // ---- Configuration -------------------------------------------------------------------
 //
-#define USE_1WIRE_TEMPERATURE
+// #define USE_1WIRE_TEMPERATURE
 // #define USE_DHT11_TEMPERATURE
 // #define USE_RELAY_0
 // RELAY_1 and DFPlayer are mutually exclusive
 // #define USE_RELAY_1
 #define USE_STATUS_0
 // STATUS_1 and DFPlayer are mutually exclusive
-#define USE_STATUS_1
-// #define USE_DFPLAYER
+// #define USE_STATUS_1
+#define USE_DFPLAYER
 // #define PLAY_TRIGGER_RELAY_0
-// #define USE_MIDI
+#define USE_MIDI
 // #define RELAY_POSITIVE_LOGIC
 // #define RELAY_NEGATIVE_LOGIC
 //
@@ -43,7 +43,7 @@
 
 
 
-#define VERSION				"1.7"
+#define VERSION				"1.8"
 
 
 #define SCREEN_WIDTH		128		// OLED display width, in pixels
@@ -234,17 +234,21 @@ void dfpPrintDetail(uint8_t type, int value) {
 		case DFPlayerCardOnline:
 			Serial.println(F("DFP: Card Online."));
 			D(F("Card Online."));
+			Serial.print(F("DFP: "));
+			Serial.print(dfp.readFileCounts());
+			Serial.println(F(" items on card."));
+			D(dfp.readFileCounts() + " items.");
 			break;
 		case DFPlayerUSBInserted:
-			Serial.println("DFP: USB Inserted.");
+			Serial.println(F("DFP: USB Inserted."));
 			break;
 		case DFPlayerUSBRemoved:
-			Serial.println("DFP: USB Removed.");
+			Serial.println(F("DFP: USB Removed."));
 			break;
 		case DFPlayerPlayFinished:
-			Serial.print(F("DFP: Number:"));
+			Serial.print(F("DFP: item "));
 			Serial.print(value);
-			Serial.println(F(" Play Finished."));
+			Serial.println(F(" Play finished."));
 			D("Play " + String(value) + " finished.");
 #ifdef PLAY_TRIGGER_RELAY_0
 			delay(200);
@@ -646,15 +650,18 @@ void callback(char* in_topic, byte* in_message, unsigned int length) {
 	String	args;
 
 	// Convert in_message to a String
-	strncpy(buf, (char*)in_message, length);
-	buf[length] = 0;
-	message = String(buf);
-	Serial.println("t: " + String(in_topic));
-	Serial.println("m: " + message);
+	if (length == 0) return;
+
+	size_t n = (length < sizeof(buf) - 1) ? length : (sizeof(buf) - 1);
+	memcpy(buf, in_message, n);
+	buf[n] = '\0';
+
+	Serial.print(F("t: ")); Serial.println(in_topic);
+	Serial.print(F("m: ")); Serial.println(buf);
 
 	StaticJsonDocument<512> doc;
 
-	DeserializationError error = deserializeJson(doc, message);
+	DeserializationError error = deserializeJson(doc, buf);
 	const char* jsonValue;
 
 	if (error) {
@@ -663,33 +670,52 @@ void callback(char* in_topic, byte* in_message, unsigned int length) {
 	}
 
 	// --- Command ---
+	// 	/temperature
+	// 		{"command": "fetch"}
+	// 		{"command": "set-rate", "rate": "int-as-string, 0=disable"}
+	// 	/status
+	// 		{"command": "set-rate", "rate": "int-as-string, 0=disable"}
+	// 	/relay
+	// 		{"command": "set", "device": 0|1, "state": on|off|pulse}
+	//	/audio
+	//		{"command": "play", "item": "1-indexed int-as-string"}
+	
+	// Valid: fetch|set-rate|set|play
 	jsonValue = doc["command"];
 	command = String(jsonValue);
 
 	if(command.length() == 0) {
 		return;
 	}
-	Serial.println("Command: " + command);
 
 	// Parse the topic into parts.
 	// we use spencer/systemID/<device>
 	const char delimeter[2] = "/";
 
+	char topicCopy[128];
+	strncpy(topicCopy, in_topic, sizeof(topicCopy)-1);
+	topicCopy[sizeof(topicCopy)-1] = '\0';
+
 	// Spencer prefix
-	token = strtok(in_topic, delimeter);
-	Serial.println("1: " + String(token));
+	token = strtok(topicCopy, delimeter);
+	if(!token) return;
+// 	Serial.println("1: " + String(token));
 
 	// Since we only subscribed to topics matching our systemID, we don't need to check it here.
 	token = strtok(NULL, delimeter);
-	Serial.println("2: " + String(token));
+	if(!token) return;
+// 	Serial.println("2: " + String(token));
 
 	// Now get the device
 	token = strtok(NULL, delimeter);
+	if(!token) return;
 	device = String(token);
-	Serial.println("3: " + device);
+// 	Serial.println("3: " + device);
 
- 
- 	if(command == "fetch") {
+	Serial.print(F("MQTT: Device: ") + device);
+	Serial.println(F(", Command: ") + command);
+
+  	if(command == "fetch") {
 	 	if(device == "temperature") {
 			publishTemperature((void *)0);
 			publishHumidity((void *)0);
@@ -780,7 +806,8 @@ void callback(char* in_topic, byte* in_message, unsigned int length) {
 		}
  	
 #ifdef USE_DFPLAYER
- 		D("Play item " + item);
+ 		D(F("Play item ") + item);
+		Serial.println(F("DFP: Play item ") + item);
 #ifdef USE_MIDI
 		midiA.sendNoteOn(61, 127, 1);    // Send a Note (pitch 42, velo 127 on channel 1)
 #endif
@@ -1039,8 +1066,8 @@ void setupDisplay()
 
 void setupDFP() {
 #ifdef USE_DFPLAYER
-	D(F("DFP: Initializing..."));
-	Serial.println(F("DFP: Initializing..."));
+	D(F("DFP: Initializing ..."));
+	Serial.println(F("DFP: Initializing ..."));
 
 	mySoftwareSerial.begin(9600);
   
@@ -1054,6 +1081,10 @@ void setupDFP() {
 	}
 	D(F("DFP: Online."));
 	Serial.println(F("DFP: Online."));
+
+	Serial.print(F("DFP: "));
+	Serial.print(dfp.readFileCounts());
+	Serial.println(F(" items on card."));
 
 	dfp.volume(30);  //Set volume value. From 0 to 30
 
@@ -1074,10 +1105,14 @@ void welcome() {
 		delay(300);
 	}
 
+	Serial.print(F("MQTT Agent, V "));
+	Serial.print(VERSION); 
+	Serial.println(F(". Copyright (C) 2026, Marc D. Spencer")); 
+
 	display.print(F("MQTT Agent, V"));
 	display.println(VERSION); 
 	display.println(); 
-	display.println(F("(C) 2024"));
+	display.println(F("(C) 2026"));
 	display.println(F("Marc D. Spencer")); 
 
 	display.display();
@@ -1177,32 +1212,39 @@ void mqttConnect() {
 
 
 void mqttSubscribe() {
-	if(client.connected()) {
-		char buf[32];
-
-		memset(buf, 0, sizeof(buf));
-		strncpy(buf, "spencer/", sizeof(buf));
-		strcat(buf, systemID);
-		strcat(buf, "/+");
-
-		Serial.print("MQTT: Subscribing to ");
-		Serial.println(buf);
-
-		client.subscribe(buf);
-
-		if(appConfig.temperatureUpdateRate > 0)
-			temperatureTimer = timer.every(appConfig.temperatureUpdateRate * 1000, publishTemperature, (void *)0);
-
-		if(appConfig.statusUpdateRate > 0)
-			statusTimer = timer.every(appConfig.statusUpdateRate * 1000, publishStatus, (void *)0);
-	} else {
-		D(F("MQTT: Not connected."));
+	if (!client.connected()) {
 		Serial.println(F("MQTT: Subscribe failed. Not connected."));
+		return;
 	}
+	
+	char topic[128];
+	
+	snprintf(topic, sizeof(topic), "spencer/%s/temperature", systemID);
+	client.subscribe(topic);
+	
+	snprintf(topic, sizeof(topic), "spencer/%s/status", systemID);
+	client.subscribe(topic);
+	
+	snprintf(topic, sizeof(topic), "spencer/%s/relay", systemID);
+	client.subscribe(topic);
+	
+	snprintf(topic, sizeof(topic), "spencer/%s/audio", systemID);
+	client.subscribe(topic);
+	
+	Serial.print(F("MQTT: Subscribed to spencer/")); Serial.print(systemID);
+	Serial.println(F("/{temperature,status,relay,audio}"));
+	
+	if (appConfig.temperatureUpdateRate > 0)
+		temperatureTimer = timer.every(appConfig.temperatureUpdateRate * 1000, publishTemperature, (void*)0);
+	
+	if (appConfig.statusUpdateRate > 0)
+		statusTimer = timer.every(appConfig.statusUpdateRate * 1000, publishStatus, (void*)0);
 }
 
 
 void setup() {
+	delay(3000);
+	
 #if defined (USE_RELAY_0) || defined (PLAY_TRIGGER_RELAY_0)
 	pinMode(PIN_RELAY_0, OUTPUT);
 	digitalWrite(PIN_RELAY_0, LOGIC_LOW);
@@ -1247,23 +1289,13 @@ void setup() {
 
 
 	Serial.begin(115200);
+	delay(1000);
 	Serial.println();
 
-	Serial.print(F("\n"));
-	Serial.print(F(VERSION));
+	delay(1000);
 	Serial.println(F("\n\n"));
-
-	if(!SPIFFS.begin()) {
-		Serial.println(F("SPIFFS: Mount Failed"));
-		return;
-	} else {
-		Serial.println(F("SPIFFS: OK"));
-		listDir(SPIFFS, "/");
-	}
-
-	AutoConnectConfig acConfig;
-
 	welcome();
+	Serial.println();
 
 #ifdef USE_DHT11_TEMPERATURE
 	Serial.println(F("Config: DHT11 Temperature enabled"));
@@ -1317,12 +1349,20 @@ void setup() {
 	Serial.println(F("Config: MIDI disabled"));
 #endif
 
-	Serial.println();
+	if(!SPIFFS.begin()) {
+		Serial.println(F("SPIFFS: Mount Failed"));
+		return;
+	} else {
+		Serial.println(F("SPIFFS: OK"));
+		listDir(SPIFFS, "/");
+	}
+
+	AutoConnectConfig acConfig;
 
 	// Should load default config if run for the first time
-	Serial.println(F("Loading configuration..."));
+	Serial.print(F("Loading configuration ... "));
 	if(! loadConfiguration(CONFIG_FILE, appConfig)) {
-		Serial.println(F("Saving default configuration..."));
+		Serial.print(F("Saving default configuration ... "));
 	 	saveConfiguration(CONFIG_FILE, appConfig);
 	}
 	Serial.println(F("Done."));
@@ -1381,7 +1421,7 @@ void setup() {
 	if (Portal.begin()) {  
 		Portal.saveCredential("/ac_credt", SPIFFS);
 		D("IP: " + WiFi.localIP().toString());
-		Serial.println(F("IP: ") + WiFi.localIP().toString() + F("\n"));
+		Serial.println(F("IP: ") + WiFi.localIP().toString());
 	} else {
 	}
 
@@ -1432,8 +1472,8 @@ void loop() {
 			timer.cancel(temperatureTimer);
 			timer.cancel(statusTimer);
 
-			D(F("MQTT: Reconnecting..."));
-			Serial.println("MQTT: Reconnecting...");
+			D(F("MQTT: Reconnecting ..."));
+			Serial.println("MQTT: Reconnecting ...");
 			mqttConnect();
 			mqttSubscribe();
 
