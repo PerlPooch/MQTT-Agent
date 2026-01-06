@@ -1,24 +1,26 @@
 // ---- Configuration -------------------------------------------------------------------
 //
-// #define USE_1WIRE_TEMPERATURE
-// #define USE_DHT11_TEMPERATURE
-// #define USE_RELAY_0
-// RELAY_1 and DFPlayer are mutually exclusive
-// #define USE_RELAY_1
 #define USE_STATUS_0
 // STATUS_1 and DFPlayer are mutually exclusive
 // #define USE_STATUS_1
+#define INVERT_STATUS
+#define USE_RELAY_0
+// RELAY_1 and DFPlayer are mutually exclusive
+// #define USE_RELAY_1
 #define USE_DFPLAYER
-// #define PLAY_TRIGGER_RELAY_0
-#define USE_MIDI
-// #define RELAY_POSITIVE_LOGIC
+#define PLAY_TRIGGER_RELAY_0
+// #define USE_MIDI
+#define RELAY_POSITIVE_LOGIC
 // #define RELAY_NEGATIVE_LOGIC
+#define USE_1WIRE_TEMPERATURE
+// #define USE_DHT11_TEMPERATURE
 //
 // --------------------------------------------------------------------------------------
 
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <AutoConnect.h>
+#include <AutoConnectCredential.h>
 #include <PubSubClient.h>
 #ifdef USE_1WIRE_TEMPERATURE
 #include <OneWire.h>
@@ -73,6 +75,8 @@
 #undef AUTOCONNECT_MENULABEL_HOME
 #define AUTOCONNECT_MENULABEL_HOME        "Activate"
 #define AC_USE_SPIFFS
+#define AC_DEBUG                                // Monitor message output activation
+#define AC_DEBUG_PORT           Serial          // Default message output device
 
 #define CONFIG_FILE			"/config.json"
 #define AUX_SETTING_URI		"/mqtt_setting"
@@ -88,6 +92,7 @@
 #define	DFPLAYER_RESET		3600	// Time(s) between resetting DFPlayer
 #define ONLINE_CHECK_PERIOD 10000	// Time(ms) between checks to see if we're still online
 #define REBOOT_DAYS			7		// Reboot every N days
+#define WIFI_RETRY_PERIOD	10000UL	// Time(ms) between WiFi connection retries
 
 #ifdef RELAY_POSITIVE_LOGIC
 #define LOGIC_HIGH 1
@@ -103,6 +108,7 @@ char				systemID[32];		// System ID. Based on the WiFi MAC
 
 ESP8266WebServer 	Server;
 AutoConnect      	Portal(Server);
+AutoConnectConfig	acConfig;
 
 #ifdef USE_1WIRE_TEMPERATURE
 OneWire 			oneWire(PIN_TEMP_0);
@@ -137,10 +143,15 @@ Timer<>::Task		statusTimer;
 #ifdef USE_DFPLAYER
 Timer<>::Task		dfplayerTimer;
 #endif
-auto				timer = timer_create_default();
-unsigned long		lastMQTTOnlineCheck;
-static const uint32_t
-					rebootTime = (uint32_t)((uint32_t)REBOOT_DAYS * MS_PER_DAY);
+auto					timer = timer_create_default();
+unsigned long			lastMQTTOnlineCheck;
+static bool				wifiSavedCreds = false;
+static uint32_t			wifiIdleSince = 0;
+static unsigned long	wifiNextRetry = 0;
+static bool				wifiEverUp = false;
+static bool				wifiProvisioning = false;
+
+static const uint32_t	rebootTime = (uint32_t)((uint32_t)REBOOT_DAYS * MS_PER_DAY);
 
 struct AppConfig {
 	char		MQTTBroker[64];
@@ -181,7 +192,7 @@ static const char AUX_mqtt_setting[] PROGMEM = R"raw(
       {
         "name": "mqttport",
         "type": "ACInput",
-        "value": "",
+        "value": "1883",
         "label": "Port",
         "placeholder": "MQTT Port"
       },
@@ -403,6 +414,103 @@ String saveMQTTParams(AutoConnectAux& aux, PageArgument& args) {
 	return String("");
 }
 
+static bool wifiReady() {
+	if(WiFi.status() != WL_CONNECTED) return false;
+	IPAddress ip = WiFi.localIP();
+
+	return (ip[0] != 0 || ip[1] != 0 || ip[2] != 0 || ip[3] != 0);
+}
+
+static const char* wifiStatusStr(wl_status_t st) {
+	switch(st) {
+		case WL_IDLE_STATUS:     return "IDLE";
+		case WL_NO_SSID_AVAIL:   return "NO_SSID";
+		case WL_SCAN_COMPLETED:  return "SCAN_DONE";
+		case WL_CONNECTED:       return "CONNECTED";
+		case WL_CONNECT_FAILED:  return "CONNECT_FAILED";
+		case WL_CONNECTION_LOST: return "CONNECTION_LOST";
+		case WL_DISCONNECTED:    return "DISCONNECTED";
+		default:                 return "UNKNOWN";
+	}
+}
+
+static bool wifiGetStationCredentials(String& ssidOut, String& passOut) {
+	AutoConnectCredential cred;
+	station_config_t cfg;
+
+	if (cred.entries() <= 0) return false;
+	if (!cred.load((int8_t)0, &cfg)) return false;
+
+	ssidOut = String((const char*)cfg.ssid);
+	passOut = String((const char*)cfg.password);
+
+	return ssidOut.length() > 0;
+}
+
+static void wifiConnect() {
+	String ssid, pass;
+	if (!wifiGetStationCredentials(ssid, pass)) {
+		Serial.println(F("WiFi: No credentials"));
+		return;
+	}
+
+	Serial.printf("WiFi: Connecting %s\n", ssid.c_str());
+	WiFi.begin(ssid.c_str(), pass.c_str());
+}
+
+static void wifiRetryTick() {
+	if(wifiReady()) {
+		wifiIdleSince = 0;
+		return;
+	}
+
+	uint32_t now = millis();
+	if((int32_t)(now - wifiNextRetry) < 0) return;
+
+// 	Serial.println(F("WiFi: wifiRetryTick()"));
+	
+	wl_status_t st = (wl_status_t)WiFi.status();
+	IPAddress ip = WiFi.localIP();
+
+	Serial.printf("WiFi: Retry. st=%s mode=%d ip=%s.\n",
+		wifiStatusStr(st),
+		(int)WiFi.getMode(),
+		ip.toString().c_str());
+
+	// Track how long we've been stuck in IDLE
+	if(st == WL_IDLE_STATUS) {
+		if(!wifiIdleSince) wifiIdleSince = now;
+	} else {
+		wifiIdleSince = 0;
+	}
+
+	// Case 1: "CONNECTED but no IP" => bounce DHCP by cycling link
+	if (st == WL_CONNECTED && ip == IPAddress(0, 0, 0, 0)) {
+		Serial.println(F("WiFi: Connected, No-IP -> disconnect + reconnect."));
+		WiFi.disconnect(false);
+		delay(200);
+		wifiConnect();
+		wifiNextRetry = now + 2000UL;
+		return;
+	}
+
+	// Case 2: If we've been IDLE too long, restart AutoConnect ONCE
+	if(wifiIdleSince && (uint32_t)(now - wifiIdleSince) > 15000UL) {
+		Serial.println(F("WiFi: IDLE -> reconnecting."));
+		wifiIdleSince = 0;
+
+		WiFi.disconnect(false);
+		delay(200);
+
+		wifiConnect();
+
+		wifiNextRetry = now + 5000UL;
+		return;
+	}
+
+	wifiConnect();
+	wifiNextRetry = now + WIFI_RETRY_PERIOD;
+}
 
 bool clearRelay(void* opaque) {
 	const size_t relayNum = (size_t)(uintptr_t)opaque;
@@ -839,10 +947,9 @@ void callback(char* in_topic, byte* in_message, unsigned int length) {
 
 
 DynamicJsonDocument getStatusAsJSON() {
-	char	buff[10];
 	String	config;
 
-	DynamicJsonDocument doc(400);
+	DynamicJsonDocument doc(512);
 
 	doc["version"] = String(VERSION);
 
@@ -855,12 +962,25 @@ DynamicJsonDocument getStatusAsJSON() {
 	}
 
 #ifdef USE_STATUS_0
+#ifdef INVERT_STATUS
+	bool	input0 = digitalRead(PIN_STATUS_0);
+#else
 	bool	input0 = ! digitalRead(PIN_STATUS_0);
+#endif
 	config += "I0 ";
 #endif
 #ifdef USE_STATUS_1
+#ifdef INVERT_STATUS
+	bool	input1 = digitalRead(PIN_STATUS_1);
+#else
 	bool	input1 = ! digitalRead(PIN_STATUS_1);
+#endif
 	config += "I1 ";
+#endif
+#ifdef INVERT_STATUS
+	config += "I- ";
+#else
+	config += "I+ ";
 #endif
 #ifdef USE_RELAY_0
 	bool 	relay0 = digitalRead(PIN_RELAY_0);
@@ -930,7 +1050,13 @@ DynamicJsonDocument getStatusAsJSON() {
 
 
 void rootPage() {
-	char	data[400];
+	if(!wifiEverUp) return;
+	
+	char	data[512];
+
+	memset(data, 0, sizeof(data));
+
+	Serial.println("rootPage()");
 
 	if(Server.hasArg(F("statusUpdateRate"))) {
 		appConfig.statusUpdateRate = Server.arg(F("statusUpdateRate")).toInt();
@@ -1305,6 +1431,11 @@ void setup() {
 	delay(1000);
 	Serial.println();
 
+	Serial.print("\r\n\r\n");
+	Serial.print("\x1b[0m");           // attributes default
+	Serial.print("\x1b[2J\x1b[H");     // clear + home
+	// Serial.print("\x1b" "c");       // optional: full terminal reset (not always supported)
+
 	delay(1000);
 	Serial.println(F("\n\n"));
 	welcome();
@@ -1338,6 +1469,11 @@ void setup() {
 #else
 	Serial.println(F("Config: Relay 1 disabled"));
 #endif
+#ifdef INVERT_STATUS
+	Serial.println(F("Config: Status negative logic"));
+#else
+	Serial.println(F("Config: Status positive logic"));
+#endif
 #ifdef USE_STATUS_0
 	Serial.println(F("Config: Status 0 enabled"));
 #else
@@ -1362,6 +1498,11 @@ void setup() {
 	Serial.println(F("Config: MIDI disabled"));
 #endif
 
+// ----------- WiFi -----------------------------------------------------------
+
+	bool restored = false;
+
+
 	if(!SPIFFS.begin()) {
 		Serial.println(F("SPIFFS: Mount Failed"));
 		return;
@@ -1369,8 +1510,6 @@ void setup() {
 		Serial.println(F("SPIFFS: OK"));
 		listDir(SPIFFS, "/");
 	}
-
-	AutoConnectConfig acConfig;
 
 	// Should load default config if run for the first time
 	Serial.print(F("Loading configuration ... "));
@@ -1381,18 +1520,21 @@ void setup() {
 	Serial.println(F("Done."));
 
 	// Dump config file
-// 	Serial.println(F("Print config file..."));
-// 	printFile(CONFIG_FILE);
-
+//  	Serial.println(F("Print config file..."));
+//  	printFile(CONFIG_FILE);
 
 	Server.on("/", rootPage);
 
-
+	acConfig.autoReconnect = true;
 	acConfig.apid = "OSCR " + String(systemID);
 	acConfig.psk = "12345678";
 	acConfig.ota = AC_OTA_BUILTIN;
 	acConfig.title = String(systemID);
 	acConfig.homeUri = "/";
+	acConfig.beginTimeout = 60000;
+	acConfig.channel = 6;
+	
+// 	acConfig.retainPortal  = true;
 	acConfig.menuItems = AC_MENUITEM_CONFIGNEW | AC_MENUITEM_DISCONNECT | AC_MENUITEM_RESET | AC_MENUITEM_UPDATE;
 
 	if(Portal.load(FPSTR(AUX_mqtt_setting))) {
@@ -1409,37 +1551,95 @@ void setup() {
 		Serial.println("load error");
 	}
 
-	if(SPIFFS.exists("/ac_credt")) {
-		Portal.restoreCredential("/ac_credt", SPIFFS);
-	} else {
-		D(F("WiFi AP Configuration"));
-		D("");
-		D(String(acConfig.apid));
-		D("PW: " + String(acConfig.psk));
-    }
-
+	// Reset-mode overrides (also BEFORE begin/config)
 	if (is_reset == LOW) {
 		SPIFFS.remove("/ac_credt");
 
+		AutoConnectCredential cred;
+		station_config_t cfg;
+		
+		while (cred.entries() > 0) {
+			if (!cred.load((int8_t)0, &cfg)) break;
+
+			const char* ssid = (const char*)cfg.ssid;
+			if (!ssid || !ssid[0]) break;
+
+			cred.del(ssid);
+		}
+
+		WiFi.disconnect(true);   // erase SDK-stored creds
+
+		acConfig.immediateStart = true;
+		acConfig.autoRise = true;
+	
+		Serial.println(F("WiFi: Reset. AP Configuration."));
 		D(F("WiFi AP Configuration"));
 		D("");
 		D(String(acConfig.apid));
 		D("PW: " + String(acConfig.psk));
+		// NOTE: don't return yet; let the portal come up for reconfig
+
+		wifiProvisioning = true;
+	}
+	
+	// Restore saved creds if present (BEFORE begin)
+	if (SPIFFS.exists("/ac_credt")) {
+		Serial.println(F("WiFi: Using stored credentials."));
+		restored = Portal.restoreCredential("/ac_credt", SPIFFS);
+		if (!restored) {
+			Serial.println(F("WiFi: Restore Credential failed."));
+		}
+
+		wifiProvisioning = false;
+	} else {
 		acConfig.immediateStart = true;
 		acConfig.autoRise = true;
-	}
 
+		Serial.println(F("WiFi: Unconfigured. AP Configuration."));
+		D(F("WiFi AP Configuration"));
+		D("");
+		D(String(acConfig.apid));
+		D("PW: " + String(acConfig.psk));
+
+		wifiProvisioning = true;
+	}
+	
+// 	WiFi.setAutoConnect(true);
+// 	WiFi.setAutoReconnect(true);
+// 	delay(100);
+
+	// Apply config
 	Portal.config(acConfig);
+	
+// 	Serial.println(F("Portal.begin()"));
+// 	Serial.printf("pre-begin: mode=%d st=%d ip=%s\n",
+// 	  (int)WiFi.getMode(),
+// 	  (int)WiFi.status(),
+// 	  WiFi.localIP().toString().c_str());
+// 	Serial.flush();
 
-	if (Portal.begin()) {  
-		Portal.saveCredential("/ac_credt", SPIFFS);
-		D("IP: " + WiFi.localIP().toString());
-		Serial.println(F("IP: ") + WiFi.localIP().toString());
+	bool ok = Portal.begin();
+// 	Serial.printf("Portal.begin(): returned ok=%d\n", ok);
+	if (ok) {
+// 		Portal.saveCredential("/ac_credt", SPIFFS);
+		if (wifiReady()) {
+			Serial.println(F("WiFi IP: ") + WiFi.localIP().toString());
+			wifiEverUp = true;
+		} else {
+			Serial.println(F("WiFi: Portal started; STA not up yet"));
+			wifiEverUp = false;
+		}
 	} else {
+		Serial.println(F("WiFi: Connect failed. Retrying."));
+		wifiNextRetry = millis() + 1000UL;
 	}
-
+	
+	// If reset button held, you *may* want to keep running (so portal UI works)
+	// If you really want to bail out of the rest of setup when reset held:
 	if (is_reset == LOW)
 		return;
+	
+// ----------- End WiFi -------------------------------------------------------
 
 #ifdef USE_DFPLAYER
 	Serial.println(F("DFP: Setup."));
@@ -1478,8 +1678,51 @@ void loop() {
 	
   	Portal.handleClient();
 
+	if (wifiProvisioning) {
+		if (wifiReady()) {
+			wifiProvisioning = false;
+			wifiEverUp = true;
+		}
+
+		return;
+	}
+	
+	// only here:
+	wifiRetryTick();
+	
+	bool wasUp = wifiEverUp;
+
+	if(!wifiReady()) {
+		wifiSavedCreds = false;
+		wifiEverUp = false;
+
+		// Optional: only log on transition
+		if(wasUp) {
+			D(F("WiFi: Unavailable"));
+			Serial.println(F("WiFi: Unavailable"));
+		}
+
+		return;
+	}
+
+	// WiFi is up
+	if(!wasUp) {
+		D(F("WiFi: Available"));
+		Serial.println(F("WiFi: Available"));
+		wifiEverUp = true;
+		wifiProvisioning = false;
+		WiFi.setAutoConnect(true);
+		WiFi.setAutoReconnect(true);
+ 		lastMQTTOnlineCheck = 0; // force immediate MQTT attempt
+	}
+
+	if (!wifiSavedCreds) {
+		Portal.saveCredential("/ac_credt", SPIFFS);
+		wifiSavedCreds = true;
+	}
+
 	bool isConnected = client.loop();
-	if((strlen(appConfig.MQTTBroker) > 0) && ! isConnected) {
+	if((strlen(appConfig.MQTTBroker) > 0) && !isConnected) {
 		if(millis() > lastMQTTOnlineCheck) {
 			timer.cancel(happyBlinkTimer);
 			timer.cancel(temperatureTimer);
@@ -1507,7 +1750,7 @@ void loop() {
 		reset_is_down = true;
 		D("IP: " + WiFi.localIP().toString());
 		D("ID: " + String(systemID));
-		Serial.println("IP: " + WiFi.localIP().toString());
+		Serial.println("WiFi: IP: " + WiFi.localIP().toString());
 	}
 	is_reset = digitalRead(PIN_RESET_WIFI);
 	if(is_reset && reset_is_down) {
