@@ -1,3 +1,7 @@
 *.DS_Store
 8266_MQTTAgent/build
 MQTT Relay KiCAD Project/MQTT Relay-backups
+MQTT-Agent-Firmware/build
+
+MQTT-Agent-Hardware/MQTT Relay-backups
+MQTT-Agent-Hardware/OPL_Kicad_Library-master
