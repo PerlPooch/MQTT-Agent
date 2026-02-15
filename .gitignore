@@ -5,3 +5,6 @@ MQTT-Agent-Firmware/build
 
 MQTT-Agent-Hardware/MQTT Relay-backups
 MQTT-Agent-Hardware/OPL_Kicad_Library-master
+*fp-info-cache
+MQTT-Agent-Hardware/*-backups
+*-backups

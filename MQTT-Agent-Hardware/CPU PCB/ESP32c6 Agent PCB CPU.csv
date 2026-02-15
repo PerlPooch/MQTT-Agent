@@ -1,0 +1,13 @@
+"Id";"Designator";"Footprint";"Quantity";"Designation";"Supplier and ref";
+1;"J1";"Connector SIP-14-Soldertail-R";1;"Screw_Terminal_01x14";;;
+2;"R2,R1,R3,R4";"R_1206_3216Metric_Pad1.30x1.75mm_HandSolder";4;"10K";;;
+3;"SW1,SW2,SW3";"SW_PUSH_6mm_H4.3mm";3;"SW_Push";;;
+4;"U2";"DFPlayer";1;"DFPlayer_Module";;;
+5;"C3,C4";"C_1206_3216Metric_Pad1.33x1.80mm_HandSolder";2;"X7R 100nF 25V";;;
+6;"C1,C2";"C_0805_2012Metric_Pad1.18x1.45mm_HandSolder";2;"X7R 1.0uF 25V";;;
+7;"U5";"XIAO-ESP32C6-DIP";1;"XIAO-ESP32-C6";;;
+8;"R12";"R_1206_3216Metric_Pad1.30x1.75mm_HandSolder";1;"4.7K";;;
+9;"U1";"SSD1306-128x32";1;"~";;;
+10;"J2";"Molex_KK-254_AE-6410-02A_1x02_P2.54mm_Vertical";1;"Power";;;
+11;"R5";"R_1206_3216Metric_Pad1.30x1.75mm_HandSolder";1;"1K";;;
+12;"U6";"SSOP-14_5.3x6.2mm_P0.65mm";1;"74AHCT125";;;
