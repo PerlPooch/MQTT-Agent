@@ -4,6 +4,7 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <FS.h>
+#include "MDS_Platform.h"
 
 #define CONFIG_DOC_SIZE		512
 

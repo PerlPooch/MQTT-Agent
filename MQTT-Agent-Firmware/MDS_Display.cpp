@@ -2,7 +2,9 @@
 #include <Adafruit_SSD1306.h>
 
 
-MDS_Display::MDS_Display() {
+MDS_Display::MDS_Display()
+: display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET)
+{
 }
 
 MDS_Display::~MDS_Display() {
@@ -10,13 +12,13 @@ MDS_Display::~MDS_Display() {
 
 void MDS_Display::setup() {
 	Serial.println(F("MDS_Display::setup"));
-	display = Adafruit_SSD1306(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 	if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { // Address 0x3C for 128x32
 		Serial.println(F("SSD1306 allocation failed"));
 		for(;;); // Don't proceed, loop forever
 	}
 
+	display.setRotation(2);
 	clear();
 
 	display.setTextSize(1);

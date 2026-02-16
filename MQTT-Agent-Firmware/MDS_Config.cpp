@@ -1,6 +1,9 @@
 #include "MDS_Config.h"
 #include <functional>
 #include <FS.h>
+#if IS_ESP8266 || IS_ESP32
+	#include <LittleFS.h>
+#endif
 
 #define CONFIG_FILE			"/config.json"
 #define CONFIG_DOC_SIZE		512
@@ -14,12 +17,16 @@ MDS_Config::~MDS_Config() {
 
 void MDS_Config::setup() {
 //	Serial.println(F("MDS_Config::setup"));
-	SPIFFS.begin();
+#if IS_ESP32
+	LittleFS.begin(true);   // format-on-fail is handy on ESP32
+#else
+	LittleFS.begin();
+#endif
 }
 
 void MDS_Config::load() {
 //	Serial.println(F("MDS_Config::load"));
-	File file = SPIFFS.open(CONFIG_FILE, "r");
+	File file = LittleFS.open(CONFIG_FILE, "r");
 
 	if(file) {
 		StaticJsonDocument<CONFIG_DOC_SIZE> doc;
@@ -45,9 +52,9 @@ void MDS_Config::load() {
 void MDS_Config::save() {
 //	Serial.println(F("MDS_Config::save()"));
 
-	SPIFFS.remove(CONFIG_FILE);
+	LittleFS.remove(CONFIG_FILE);
 
-	File file = SPIFFS.open(CONFIG_FILE, "w");
+	File file = LittleFS.open(CONFIG_FILE, "w");
 	if (!file) {
 		Serial.println(F("Unable to create configuration file"));
 		return;
@@ -68,7 +75,7 @@ void MDS_Config::save() {
 void MDS_Config::print() {
 //	Serial.println(F("MDS_Config::printFile()"));
 
-	File file = SPIFFS.open(CONFIG_FILE, "r");
+	File file = LittleFS.open(CONFIG_FILE, "r");
 	if (!file) {
 		Serial.println(F("Unable to read file"));
 		return;

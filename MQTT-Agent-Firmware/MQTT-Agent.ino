@@ -1,26 +1,36 @@
+#include "MDS_Platform.h"
+
 // ---- Configuration -------------------------------------------------------------------
 //
 #define USE_STATUS_0
 // STATUS_1 and DFPlayer are mutually exclusive
-// #define USE_STATUS_1
+#define USE_STATUS_1
 #define INVERT_STATUS
-#define USE_RELAY_0
+// #define USE_RELAY_0
 // RELAY_1 and DFPlayer are mutually exclusive
 // #define USE_RELAY_1
-#define USE_DFPLAYER
-#define PLAY_TRIGGER_RELAY_0
+// #define USE_DFPLAYER
+// #define PLAY_TRIGGER_RELAY_0
 // #define USE_MIDI
 #define RELAY_POSITIVE_LOGIC
 // #define RELAY_NEGATIVE_LOGIC
 #define USE_1WIRE_TEMPERATURE
 // #define USE_DHT11_TEMPERATURE
+// #define ROTATE_DISPLAY
 //
 // --------------------------------------------------------------------------------------
 
-#include <ESP8266WiFi.h>
-#include <ESP8266WebServer.h>
-#include <AutoConnect.h>
-#include <AutoConnectCredential.h>
+#if IS_ESP8266
+	#include <ESP8266WiFi.h>
+	#include <ESP8266WebServer.h>
+#elif IS_ESP32
+	#include <WiFi.h>
+	#include <WebServer.h>
+	#include <esp_mac.h>
+#endif
+#include <WiFiManager.h>
+#include <Update.h>
+#include <ArduinoJson.h>
 #include <PubSubClient.h>
 #ifdef USE_1WIRE_TEMPERATURE
 #include <OneWire.h>
@@ -28,6 +38,7 @@
 #endif
 #include <arduino-timer.h>
 #include <FS.h>
+#include <LittleFS.h>
 #include <SPI.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
@@ -36,16 +47,20 @@
 #include "DHT.h"
 #endif
 #ifdef USE_DFPLAYER
-#include <SoftwareSerial.h>
+	#if IS_ESP8266
+		#include <SoftwareSerial.h>
+	#endif
 #include <DFRobotDFPlayerMini.h>
 #endif
 #ifdef USE_MIDI
-#include <MIDI.h>
+	#include <MIDI.h>
+	#if IS_ESP8266
+		#include <SoftwareSerial.h>
+	#endif
 #endif
 
 
-
-#define VERSION				"1.8"
+#define VERSION				"2.0"
 
 
 #define SCREEN_WIDTH		128		// OLED display width, in pixels
@@ -53,62 +68,107 @@
 #define OLED_RESET    		-1		// Reset pin # (or -1 if sharing Arduino reset pin)
 // #define DEBUG_D						// Mirror screen to serial
 
-#if defined (USE_RELAY_0) || defined (PLAY_TRIGGER_RELAY_0)
-#define PIN_RELAY_0 		0
+#if IS_ESP8266
+	// LED
+	#define PIN_LED 			16
+	#define PIN_LED_1			2
+	// I2C OLED
+	#define PIN_I2C_SDA			4
+	#define PIN_I2C_SCL			5
+	// DFPlayer
+	#define PIN_DFP_RX			13
+	#define PIN_DFP_TX			2
+	// Inputs
+	#define PIN_RESET_WIFI 		12
+	#ifdef USE_STATUS_0
+		#define PIN_STATUS_0 	10
+	#endif
+	#ifdef USE_STATUS_1
+		#define PIN_STATUS_1 	13
+	#endif
+	// 1-wire temp
+	#define PIN_TEMP_0		 	14
+	// Relay
+	#if defined (USE_RELAY_0) || defined (PLAY_TRIGGER_RELAY_0)
+		#define PIN_RELAY_0 	0
+	#endif
+	#ifdef USE_RELAY_1
+		#define PIN_RELAY_1 	2
+	#endif
+#elif IS_ESP32 && IS_ESP32C6
+	// LED
+	#ifndef LED_BUILTIN
+		#define LED_BUILTIN		15
+	#endif
+	#define PIN_LED				LED_BUILTIN
+	// I2C OLED
+	#define PIN_I2C_SDA			SDA    // D4 / GPIO22
+	#define PIN_I2C_SCL			SCL    // D5 / GPIO23
+	// DFPlayer
+	#define DFP_UART_NUM		1
+	#define PIN_DFP_TX			D6    // GPIO16
+	#define PIN_DFP_RX			D7    // GPIO17
+	// Inputs
+	#define PIN_RESET_WIFI		D1  // GPIO1  (button to GND, INPUT_PULLUP)
+	#ifdef USE_STATUS_0
+		#define PIN_STATUS_0	D2  // GPIO2  (INPUT_PULLUP)
+	#endif
+	#ifdef USE_STATUS_1
+		#define PIN_STATUS_1 	D8	// GPIO19
+	#endif
+	// 1-wire temp
+	#define PIN_TEMP_0			D0   // GPIO0  (1-wire)
+	// Relay
+	#if defined(USE_RELAY_0) || defined(PLAY_TRIGGER_RELAY_0)
+		#define PIN_RELAY_0		D3   // GPIO21
+	#endif
+	#ifdef USE_RELAY_1
+		#define PIN_RELAY_1 	D10
+	#endif
+#else
 #endif
-#ifdef USE_RELAY_1
-#define PIN_RELAY_1 		2
+
+// if relay is disabled, don't allow play-trigger
+#if !defined(USE_RELAY_0)
+  #undef PLAY_TRIGGER_RELAY_0
 #endif
-#define PIN_LED_1			2		// NodeMCU Secondary LED (shares pin with relay!)
-#ifdef USE_STATUS_0
-#define PIN_STATUS_0 		10
-#endif
-#ifdef USE_STATUS_1
-#define PIN_STATUS_1 		13
-#endif
-#define PIN_RESET_WIFI 		12
-#define PIN_TEMP_0		 	14
-#define PIN_LED 			16
 
-#define DHT_TYPE			DHT11
+#define DHT_TYPE				DHT11
 
-#undef AUTOCONNECT_MENULABEL_HOME
-#define AUTOCONNECT_MENULABEL_HOME        "Activate"
-#define AC_USE_SPIFFS
-#define AC_DEBUG                                // Monitor message output activation
-#define AC_DEBUG_PORT           Serial          // Default message output device
-
-#define CONFIG_FILE			"/config.json"
-#define AUX_SETTING_URI		"/mqtt_setting"
-#define AUX_SAVE_URI		"/mqtt_save"
-#define AUX_CLEAR_URI		"/mqtt_clear"
+#define CONFIG_FILE				"/config.json"
 
 
-#define	DISPLAY_TIMEOUT		5000	// Time(ms) between each display scroll
-#define	DISPLAY_LINES		4		// Number of text lines that fit on the display
-#define	RELAY_TIMEOUT		500 	// Time(ms) for relay pulses
-#define	HAPPY_PERIOD		5000	// Time(ms) for happy LED blinks
-#define	HAPPY_NOMQTT_PERIOD	10000	// Time(ms) for happy LED blinks
-#define	DFPLAYER_RESET		3600	// Time(s) between resetting DFPlayer
-#define ONLINE_CHECK_PERIOD 10000	// Time(ms) between checks to see if we're still online
-#define REBOOT_DAYS			7		// Reboot every N days
-#define WIFI_RETRY_PERIOD	10000UL	// Time(ms) between WiFi connection retries
+#define	DEFAULT_MQTT_PORT		1883
+#define	DEFAULT_TEMP_RATE		10
+#define	DEFAULT_STATUS_RATE		60
+
+#define	DISPLAY_TIMEOUT			5000	// Time(ms) between each display scroll
+#define	DISPLAY_LINES			4		// Number of text lines that fit on the display
+#define	RELAY_TIMEOUT			500 	// Time(ms) for relay pulses
+#define	HAPPY_PERIOD			5000	// Time(ms) for happy LED blinks
+#define	HAPPY_NOMQTT_PERIOD		10000	// Time(ms) for happy LED blinks
+#define	DFPLAYER_RESET			3600	// Time(s) between resetting DFPlayer
+#define ONLINE_CHECK_PERIOD 	10000	// Time(ms) between checks to see if we're still online
+#define REBOOT_DAYS				7		// Reboot every N days
+#define WIFI_RETRY_PERIOD		10000UL	// Time(ms) between WiFi connection retries
 
 #ifdef RELAY_POSITIVE_LOGIC
-#define LOGIC_HIGH 1
-#define LOGIC_LOW 0
+	#define LOGIC_HIGH 1
+	#define LOGIC_LOW 0
 #else
-#define LOGIC_HIGH 0
-#define LOGIC_LOW 1
+	#define LOGIC_HIGH 0
+	#define LOGIC_LOW 1
 #endif
 
-#define MS_PER_DAY			(24UL * 60UL * 60UL * 1000UL)
+#define MS_PER_DAY				(24UL * 60UL * 60UL * 1000UL)
 
 char				systemID[32];		// System ID. Based on the WiFi MAC
 
+#if IS_ESP8266
 ESP8266WebServer 	Server;
-AutoConnect      	Portal(Server);
-AutoConnectConfig	acConfig;
+#elif IS_ESP32
+WebServer 			Server;
+#endif
 
 #ifdef USE_1WIRE_TEMPERATURE
 OneWire 			oneWire(PIN_TEMP_0);
@@ -120,7 +180,11 @@ DHT					dht(PIN_TEMP_0, DHT_TYPE);
 #endif
 
 #ifdef USE_DFPLAYER
-SoftwareSerial mySoftwareSerial(13, 2); // RX, TX  D4, D7
+	#if IS_ESP8266
+		SoftwareSerial mySoftwareSerial(PIN_DFP_RX, PIN_DFP_TX); // RX, TX
+	#elif IS_ESP32
+		HardwareSerial mySoftwareSerial(DFP_UART_NUM);
+	#endif
 DFRobotDFPlayerMini dfp;
 #endif
 
@@ -143,9 +207,9 @@ Timer<>::Task		statusTimer;
 #ifdef USE_DFPLAYER
 Timer<>::Task		dfplayerTimer;
 #endif
+
 auto					timer = timer_create_default();
 unsigned long			lastMQTTOnlineCheck;
-static bool				wifiSavedCreds = false;
 static uint32_t			wifiIdleSince = 0;
 static unsigned long	wifiNextRetry = 0;
 static bool				wifiEverUp = false;
@@ -161,68 +225,78 @@ struct AppConfig {
 };
 AppConfig appConfig;
 
+// === Upload/Update
+static volatile bool shouldReboot = false;
+
+static void handleUploadPage();
+static void handleUploadPost();
+static void handleUploadStream();
+
+// === WiFi Manager
+static 					WiFiManager wm;
+static bool 			wmShouldSave = false;
+static bool				wmParamsAdded = false;
+
+static void wmSaveCallback() {
+	wmShouldSave = true;
+}
+
+static char wmMqttPort[6];     // "65535" + NUL
+static char wmTempRate[6];
+static char wmStatusRate[6];
+
+static WiFiManagerParameter pMqttBroker(
+	"mqttBroker",
+	"MQTT Broker",
+	appConfig.MQTTBroker,
+	sizeof(appConfig.MQTTBroker)
+);
+
+static WiFiManagerParameter pMqttPort(
+	"mqttPort",
+	"MQTT Port",
+	wmMqttPort,
+	sizeof(wmMqttPort)
+);
+
+static WiFiManagerParameter pTempRate(
+	"tempRate",
+	"Temperature Update Rate (s)",
+	wmTempRate,
+	sizeof(wmTempRate)
+);
+
+static WiFiManagerParameter pStatusRate(
+	"statusRate",
+	"Status Update Rate (s)",
+	wmStatusRate,
+	sizeof(wmStatusRate)
+);
+
+static uint16_t parseU16(const char* s, uint16_t def) {
+	if(!s || !*s) return def;
+
+	char* end = nullptr;
+	unsigned long v = strtoul(s, &end, 10);
+	if(end == s) return def;
+	if(v > 65535UL) return def;
+	return (uint16_t)v;
+}
+
+static void normalizeAppConfigDefaults() {
+	if(appConfig.MQTTPort == 0) appConfig.MQTTPort = DEFAULT_MQTT_PORT;
+	if(appConfig.temperatureUpdateRate == 0) appConfig.temperatureUpdateRate = DEFAULT_TEMP_RATE;
+	if(appConfig.statusUpdateRate == 0) appConfig.statusUpdateRate = DEFAULT_STATUS_RATE;
+}
+
 struct Screen {
 	String		lines[DISPLAY_LINES];
 };
 Screen screen;
 
-bool lastStatus0, lastStatus1;
+bool lastStatus0 = false, lastStatus1 = false;
 bool reset_is_down = false;
 
-static const char AUX_mqtt_setting[] PROGMEM = R"raw(
-[
-  {
-    "title": "Configure MQTT",
-    "uri": "/mqtt_setting",
-    "menu": true,
-    "element": [
-      {
-        "name": "style",
-        "type": "ACStyle",
-        "value": "label+input,label+select{position:sticky;left:120px;width:230px!important;box-sizing:border-box;}"
-      },
-      {
-        "name": "mqttserver",
-        "type": "ACInput",
-        "value": "",
-        "label": "Broker",
-        "pattern": "^(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\\-]*[a-zA-Z0-9])\\.)*([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9\\-]*[A-Za-z0-9])$",
-        "placeholder": "MQTT Broker"
-      },
-      {
-        "name": "mqttport",
-        "type": "ACInput",
-        "value": "1883",
-        "label": "Port",
-        "placeholder": "MQTT Port"
-      },
-      {
-        "name": "save",
-        "type": "ACSubmit",
-        "value": "Save",
-        "uri": "/mqtt_save"
-      }
-    ]
-  },
-  {
-    "title": "MQTT",
-    "uri": "/mqtt_save",
-    "menu": false,
-    "element": [
-      {
-        "name": "style",
-        "type": "ACStyle",
-        "value": "label+input,label+select{position:sticky;left:120px;width:230px!important;box-sizing:border-box;}"
-      },
-      {
-        "name": "parameters",
-        "type": "ACText",
-        "value": "Saved."
-      }
-    ]
-  }
-]
-)raw";
 
 
 #ifdef USE_DFPLAYER
@@ -306,7 +380,7 @@ void dfpPrintDetail(uint8_t type, int value) {
 #endif
 
 void printFile(const char *filename) {
-	File file = SPIFFS.open(filename, "r");
+	File file = LittleFS.open(filename, "r");
 	if (!file) {
 		Serial.println(F("Unable to read file"));
 		return;
@@ -323,6 +397,7 @@ void printFile(const char *filename) {
 void listDir(fs::FS &fs, const char *dirname){
 	Serial.printf("  Directory %s:\n", dirname);
 
+#if IS_ESP8266
 	String str = "";
 	Dir dir = fs.openDir(dirname);
 	while (dir.next()) {
@@ -333,10 +408,25 @@ void listDir(fs::FS &fs, const char *dirname){
 		str += F("b)\n");
 	}
 	Serial.print(str);
+#elif IS_ESP32
+	File root = fs.open(dirname);
+	if(!root || !root.isDirectory()) {
+		Serial.println(F("    <not a directory>"));
+		return;
+	}
+
+	for(File f = root.openNextFile(); f; f = root.openNextFile()) {
+		Serial.print(F("    "));
+		Serial.print(f.name());
+		Serial.print(F(" ("));
+		Serial.print((uint32_t)f.size());
+		Serial.println(F("b)"));
+	}
+#endif
 }
 
 bool loadConfiguration(const char *filename, AppConfig &config) {
-	File file = SPIFFS.open(filename, "r");
+	File file = LittleFS.open(filename, "r");
 
 	if (file) {
 		StaticJsonDocument<512> doc;
@@ -369,9 +459,9 @@ bool loadConfiguration(const char *filename, AppConfig &config) {
 
 
 void saveConfiguration(const char *filename, const AppConfig &config) {
-	SPIFFS.remove(filename);
+	LittleFS.remove(filename);
 
-	File file = SPIFFS.open(filename, "w");
+	File file = LittleFS.open(filename, "w");
 	if (!file) {
 		Serial.println(F("Unable to create configuration file"));
 		return;
@@ -384,6 +474,8 @@ void saveConfiguration(const char *filename, const AppConfig &config) {
 	doc["temperatureUpdateRate"] = config.temperatureUpdateRate;
 	doc["statusUpdateRate"] = config.statusUpdateRate;
 
+	serializeJsonPretty(doc, Serial);
+
 	if (serializeJson(doc, file) == 0) {
 		Serial.println(F("Unable to write configuration file"));
 	}
@@ -392,27 +484,93 @@ void saveConfiguration(const char *filename, const AppConfig &config) {
 }
 
 
-String saveMQTTParams(AutoConnectAux& aux, PageArgument& args) {
-	AutoConnectAux* mqtt_setting = Portal.aux(Portal.where());
-	AutoConnectInput& serverInput = mqtt_setting->getElement<AutoConnectInput>("mqttserver");
-	AutoConnectInput& portInput = mqtt_setting->getElement<AutoConnectInput>("mqttport");
+static bool wifiBegin(bool forcePortal) {
+	wmShouldSave = false;
 
-	String serverValue = serverInput.value;
-	String portValue = portInput.value;
+	normalizeAppConfigDefaults();
 
-	strncpy(appConfig.MQTTBroker, serverValue.c_str(), sizeof(appConfig.MQTTBroker));
-	appConfig.MQTTPort = (uint16_t)portValue.toInt();
-
-	D(F("Configuration updated."));
-
-	saveConfiguration(CONFIG_FILE, appConfig);
-	printFile(CONFIG_FILE);
+	uint16_t portForUi   = appConfig.MQTTPort;
+	uint16_t tempForUi   = appConfig.temperatureUpdateRate;
+	uint16_t statusForUi = appConfig.statusUpdateRate;
 	
-	AutoConnectText&  result = aux["parameters"].as<AutoConnectText>();
-	result.value = "Broker: " + serverValue + ":" + portValue;
+	snprintf(wmMqttPort,   sizeof(wmMqttPort),   "%u", (unsigned)portForUi);
+	snprintf(wmTempRate,   sizeof(wmTempRate),   "%u", (unsigned)tempForUi);
+	snprintf(wmStatusRate, sizeof(wmStatusRate), "%u", (unsigned)statusForUi);
 
-	return String("");
+	// Fresh manager state each time we enter provisioning
+	wm.setSaveConfigCallback(wmSaveCallback);
+	wm.setBreakAfterConfig(true);
+	wm.setConnectTimeout(20);
+	wm.setConfigPortalTimeout(180);
+	
+	if(!wmParamsAdded) {
+		wm.addParameter(&pMqttBroker);
+		wm.addParameter(&pMqttPort);
+		wm.addParameter(&pTempRate);
+		wm.addParameter(&pStatusRate);
+		wmParamsAdded = true;
+	}	
+
+	WiFi.mode(WIFI_STA);
+
+	String apName = "OSCR " + String(systemID);
+	const char* apPass = "12345678";
+
+	wm.setDebugOutput(false);
+
+	static const char wmHead[] PROGMEM = R"rawliteral(
+<style>
+:root{--bg:#000000;--text:#fff;--card:#20202080;--border:rgba(43,14,161,.75);--shadow:0 12px 30px rgba(0,0,0,.10);--radius:8px;}
+html,body{height:100%;}
+body{margin:0;color:var(--text);background:var(--bg);font-family:Helvetica,Arial,sans-serif;}
+/* card-ish main container */
+main, .wrap, .content, form{max-width:560px;margin:4px auto;padding:8px;background:var(--card);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);}
+button{padding:12px;}
+.wrap{display:block;}
+h1,h2,h3{margin:0 0 14px 0;font-size:18px;font-weight:600;background:inherit;}
+h3{font-size:12px;font-weight:300;}
+input,button,select{font:inherit;}
+button,input[type=submit]{border-radius:var(--radius);cursor:pointer;background-color:#c4c4c4;color:#000;font-weight:600}
+</style>
+	)rawliteral";
+
+	wm.setCustomHeadElement(wmHead);
+	wm.setDarkMode(true);
+	wm.setTitle("Agent Configuration");
+
+	bool ok = false;
+	if(forcePortal) {
+		ok = wm.startConfigPortal(apName.c_str(), apPass);
+	} else {
+		ok = wm.autoConnect(apName.c_str(), apPass);
+	}
+
+	if (!ok) {
+		Serial.println(F("WiFiManager: failed to connect / portal exited"));
+		return false;
+	}
+
+	// Persist YOUR config model if portal saved
+	if (wmShouldSave) {
+		strlcpy(appConfig.MQTTBroker,
+		        pMqttBroker.getValue(),
+		        sizeof(appConfig.MQTTBroker));
+
+		appConfig.MQTTPort =
+			parseU16(pMqttPort.getValue(), DEFAULT_MQTT_PORT);
+
+		appConfig.temperatureUpdateRate =
+			parseU16(pTempRate.getValue(), DEFAULT_TEMP_RATE);
+
+		appConfig.statusUpdateRate =
+			parseU16(pStatusRate.getValue(), DEFAULT_STATUS_RATE);
+
+		saveConfiguration(CONFIG_FILE, appConfig);
+	}
+
+	return true;
 }
+
 
 static bool wifiReady() {
 	if(WiFi.status() != WL_CONNECTED) return false;
@@ -434,28 +592,9 @@ static const char* wifiStatusStr(wl_status_t st) {
 	}
 }
 
-static bool wifiGetStationCredentials(String& ssidOut, String& passOut) {
-	AutoConnectCredential cred;
-	station_config_t cfg;
-
-	if (cred.entries() <= 0) return false;
-	if (!cred.load((int8_t)0, &cfg)) return false;
-
-	ssidOut = String((const char*)cfg.ssid);
-	passOut = String((const char*)cfg.password);
-
-	return ssidOut.length() > 0;
-}
-
 static void wifiConnect() {
-	String ssid, pass;
-	if (!wifiGetStationCredentials(ssid, pass)) {
-		Serial.println(F("WiFi: No credentials"));
-		return;
-	}
-
-	Serial.printf("WiFi: Connecting %s\n", ssid.c_str());
-	WiFi.begin(ssid.c_str(), pass.c_str());
+	WiFi.mode(WIFI_STA);
+	WiFi.begin();
 }
 
 static void wifiRetryTick() {
@@ -494,7 +633,7 @@ static void wifiRetryTick() {
 		return;
 	}
 
-	// Case 2: If we've been IDLE too long, restart AutoConnect ONCE
+	// Case 2: If we've been IDLE too long, force a reconnect
 	if(wifiIdleSince && (uint32_t)(now - wifiIdleSince) > 15000UL) {
 		Serial.println(F("WiFi: IDLE -> reconnecting."));
 		wifiIdleSince = 0;
@@ -511,6 +650,96 @@ static void wifiRetryTick() {
 	wifiConnect();
 	wifiNextRetry = now + WIFI_RETRY_PERIOD;
 }
+
+static void handleUploadPage()
+{
+	if(!wifiEverUp) return;
+
+	// Minimal page: choose .bin and POST it
+	static const char uploadHtml[] =
+		"<!doctype html><html><head><meta charset='utf-8'>"
+		"<meta name='viewport' content='width=device-width,initial-scale=1'>"
+		"<title>Update Firmware</title>"
+		"<style>"
+		":root{--bg:#000000;--text:#fff;--card:#20202080;--border:rgba(43,14,161,0.58);--shadow:0 12px 30px rgba(0,0,0,.10);--radius:8px}"
+		"html,body{height:100%;}"
+		"body{margin:0;color:var(--text);background:var(--bg);font-family:Helvetica,Arial,sans-serif;}"
+		".card{max-width:560px;margin:10vh auto;padding:24px;background:var(--card);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);}"
+		".row{display:flex;gap:8px;align-items:center;}"
+		".row button{margin-left:auto;}"
+		"h3{margin:0 0 14px 0;font-size:18px;font-weight:600;}"
+		"input,button{font:inherit;}"
+		"button{margin-left:8px;border-radius:var(--radius);background:#fff;cursor:pointer;}"
+		"</style>"
+		"</head><body>"
+		"<div class='card'>"
+		"<h3>Update Firmware</h3>"
+		"<form method='POST' action='/upload' enctype='multipart/form-data'>"
+		"<div class='row'>"
+		"<input type='file' name='firmware' accept='.bin' required>"
+		"<button type='submit'>Update</button>"
+		"</div>"
+		"</form>"
+		"</div>"
+		"</body></html>";
+
+	Server.send(200, "text/html", uploadHtml);
+}
+
+static void handleUploadPost()
+{
+	// Called after upload completes (success or failure)
+	if (Update.hasError()) {
+		String msg = "Update failed.\n";
+		Server.send(500, "text/plain", msg);
+		return;
+	}
+
+	Server.send(200, "text/plain", "Update OK. Rebooting...\n");
+	shouldReboot = true; // reboot in loop after response is sent
+}
+
+static void handleUploadStream()
+{
+	HTTPUpload &upload = Server.upload();
+
+	if (upload.status == UPLOAD_FILE_START) {
+		Serial.printf("OTA: Start: %s\n", upload.filename.c_str());
+		D(F("OTA: Start ..."));
+
+		// Optional: stop other activity if you want (MQTT, timers, etc.)
+		// client.disconnect();
+
+		if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+			Serial.println("OTA: Update.begin() failed");
+			D(F("OTA: failed."));
+			Update.printError(Serial);
+		}
+
+	} else if (upload.status == UPLOAD_FILE_WRITE) {
+		if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+			Serial.println("OTA: Update.write() failed");
+			D(F("OTA: failed."));
+			Update.printError(Serial);
+		}
+
+	} else if (upload.status == UPLOAD_FILE_END) {
+		if (Update.end(true)) {
+			Serial.printf("OTA: Success. Size: %u\n", upload.totalSize);
+			D(F("OTA: Success."));
+		} else {
+			Serial.println("OTA: Update.end() failed");
+			D(F("OTA: failed."));
+			Update.printError(Serial);
+		}
+
+	} else if (upload.status == UPLOAD_FILE_ABORTED) {
+		Serial.println("OTA: Upload aborted");
+		D(F("OTA: aborted."));
+		Update.end();
+	}
+}
+
 
 bool clearRelay(void* opaque) {
 	const size_t relayNum = (size_t)(uintptr_t)opaque;
@@ -687,12 +916,15 @@ bool publishRelays(void* opaque) {
 #else
 	bool relay1 = false;
 #endif
-#ifdef USE_POSITIVE_LOGIC
+#ifdef RELAY_POSITIVE_LOGIC
 #else
-	relay0 = !relay0;
-	relay1 = !relay1;
+	#ifdef USE_RELAY_0
+		relay0 = !relay0;
+	#endif
+	#ifdef USE_RELAY_1
+		relay1 = !relay1;
+	#endif
 #endif
-
 	D(String(F("Relays: ")) + String(relay0) + String(F(" ")) + String(relay1));
 
 	memset(buf, 0, sizeof(buf));
@@ -925,8 +1157,8 @@ void callback(char* in_topic, byte* in_message, unsigned int length) {
 		}
  	
 #ifdef USE_DFPLAYER
- 		D(F("Play item ") + item);
-		Serial.println(F("DFP: Play item ") + item);
+		D(String(F("Play item ")) + item);
+		Serial.println(String(F("DFP: Play item ")) + item);
 #ifdef USE_MIDI
 		midiA.sendNoteOn(61, 127, 1);    // Send a Note (pitch 42, velo 127 on channel 1)
 #endif
@@ -1056,8 +1288,6 @@ void rootPage() {
 
 	memset(data, 0, sizeof(data));
 
-	Serial.println("rootPage()");
-
 	if(Server.hasArg(F("statusUpdateRate"))) {
 		appConfig.statusUpdateRate = Server.arg(F("statusUpdateRate")).toInt();
 		D("Set-rate Status: " + String(appConfig.statusUpdateRate));
@@ -1169,24 +1399,34 @@ void D(String m)
 	display.display();
 }
 
-void setupSystem()
-{
-	// Compute the systemID -- The unique ID for this device. This will be used as the root leaf
-	// for the MQTT topic
-	String mac = WiFi.macAddress();
-	mac.toUpperCase();
-	mac.toCharArray(systemID, sizeof(systemID));
-	systemID[sizeof(systemID) - 1] = '\0';
+static void setupSystem() {
+	uint8_t mac[6] = {0};
+
+#if IS_ESP32
+	esp_read_mac(mac, ESP_MAC_BASE);
+#else
+	WiFi.macAddress(mac);
+#endif
+
+	snprintf(systemID, sizeof(systemID),
+		"%02X:%02X:%02X:%02X:%02X:%02X",
+		mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
 
 void setupDisplay()
 {
+#if IS_ESP32
+	Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+#endif
 	if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { // Address 0x3C for 128x32
 		Serial.println(F("SSD1306 allocation failed"));
 		for(;;); // Don't proceed, loop forever
 	}
 
+#ifdef ROTATE_DISPLAY
+	display.setRotation(2);
+#endif
 	clearDisplay();
 
 	display.setTextSize(1);
@@ -1208,7 +1448,11 @@ void setupDFP() {
 	D(F("DFP: Initializing ..."));
 	Serial.println(F("DFP: Initializing ..."));
 
+#if IS_ESP8266
 	mySoftwareSerial.begin(9600);
+#elif IS_ESP32
+	mySoftwareSerial.begin(9600, SERIAL_8N1, PIN_DFP_RX, PIN_DFP_TX);
+#endif
   
 	if (!dfp.begin(mySoftwareSerial, false, true)) {
 	    Serial.println(F("DFP: Error, unable to communicate."));
@@ -1273,9 +1517,7 @@ bool clearLED(void* opaque) {
 
 bool blinkLED(void* opaque) {
 	digitalWrite(PIN_LED, 0);
-
-	timer.every(50, clearLED, (void *)0);
-	
+	timer.in(50, clearLED, nullptr);
 	return true;
 }
 
@@ -1306,7 +1548,7 @@ void mqttConnect() {
 
 	if(client.connect(buf)) {
 		D(F("MQTT: Connected."));
-		Serial.println(F("MQTT: Connected ") + String(buf));
+		Serial.println(String(F("MQTT: Connected ")) + String(buf));
 
 		if (WiFi.status() == WL_CONNECTED) {
 			long rssi = WiFi.RSSI();
@@ -1382,7 +1624,7 @@ void mqttSubscribe() {
 
 
 void setup() {
-	delay(3000);
+	delay(100);
 	
 #if defined (USE_RELAY_0) || defined (PLAY_TRIGGER_RELAY_0)
 	pinMode(PIN_RELAY_0, OUTPUT);
@@ -1393,8 +1635,10 @@ void setup() {
 	pinMode(PIN_RELAY_1, OUTPUT);
 	digitalWrite(PIN_RELAY_1, LOGIC_LOW);
 #else
+	#if IS_ESP8266
  	pinMode(PIN_LED_1, OUTPUT);
  	digitalWrite(PIN_LED_1, 1);		// PIN_RELAY_1 controls the secondary LED on the NodeMCU, so we force it off.
+	#endif
 #endif
 
 #ifdef USE_STATUS_0
@@ -1407,11 +1651,12 @@ void setup() {
 	pinMode(PIN_LED, OUTPUT);
 	digitalWrite(PIN_LED, 1);
 
+	delay(1000);
+
 	setupSystem();
 	setupDisplay();
 
 	int is_reset = 0;
-
 
 	delay(1000);
 
@@ -1498,17 +1743,25 @@ void setup() {
 	Serial.println(F("Config: MIDI disabled"));
 #endif
 
-// ----------- WiFi -----------------------------------------------------------
+// ----------- LittleFS -----------------------------------------------------------
 
 	bool restored = false;
+	bool fsOk = false;
 
+#if IS_ESP32
+	// ESP32: allow format-on-fail to recover cleanly
+	fsOk = LittleFS.begin(true);
+#else
+	// ESP8266: begin() only; format is a separate call if you want it
+	fsOk = LittleFS.begin();
+#endif
 
-	if(!SPIFFS.begin()) {
-		Serial.println(F("SPIFFS: Mount Failed"));
+	if(!fsOk) {
+		Serial.println(F("LittleFS: Mount Failed"));
 		return;
 	} else {
-		Serial.println(F("SPIFFS: OK"));
-		listDir(SPIFFS, "/");
+		Serial.println(F("LittleFS: OK"));
+		listDir(LittleFS, "/");
 	}
 
 	// Should load default config if run for the first time
@@ -1520,126 +1773,56 @@ void setup() {
 	Serial.println(F("Done."));
 
 	// Dump config file
-//  	Serial.println(F("Print config file..."));
-//  	printFile(CONFIG_FILE);
+ 	Serial.println(F("Print config file..."));
+ 	printFile(CONFIG_FILE);
+
+// ----------- WiFi -----------------------------------------------------------
 
 	Server.on("/", rootPage);
-
-	acConfig.autoReconnect = true;
-	acConfig.apid = "OSCR " + String(systemID);
-	acConfig.psk = "12345678";
-	acConfig.ota = AC_OTA_BUILTIN;
-	acConfig.title = String(systemID);
-	acConfig.homeUri = "/";
-	acConfig.beginTimeout = 60000;
-	acConfig.channel = 6;
 	
-// 	acConfig.retainPortal  = true;
-	acConfig.menuItems = AC_MENUITEM_CONFIGNEW | AC_MENUITEM_DISCONNECT | AC_MENUITEM_RESET | AC_MENUITEM_UPDATE;
-
-	if(Portal.load(FPSTR(AUX_mqtt_setting))) {
-		AutoConnectAux& mqtt_setting = *Portal.aux(AUX_SETTING_URI);
-
-		AutoConnectInput& broker = mqtt_setting.getElement<AutoConnectInput>("mqttserver");
-		broker.value = appConfig.MQTTBroker;
-
- 		AutoConnectInput& port = mqtt_setting.getElement<AutoConnectInput>("mqttport");
- 		port.value = appConfig.MQTTPort;
-
-		Portal.on(AUX_SAVE_URI, saveMQTTParams);
-    } else {
-		Serial.println("load error");
-	}
-
-	// Reset-mode overrides (also BEFORE begin/config)
+	// Reset button logic: if held, force portal + clear stored WiFi creds
+	bool forcePortal = false;
 	if (is_reset == LOW) {
-		SPIFFS.remove("/ac_credt");
-
-		AutoConnectCredential cred;
-		station_config_t cfg;
-		
-		while (cred.entries() > 0) {
-			if (!cred.load((int8_t)0, &cfg)) break;
-
-			const char* ssid = (const char*)cfg.ssid;
-			if (!ssid || !ssid[0]) break;
-
-			cred.del(ssid);
-		}
-
-		WiFi.disconnect(true);   // erase SDK-stored creds
-
-		acConfig.immediateStart = true;
-		acConfig.autoRise = true;
-	
-		Serial.println(F("WiFi: Reset. AP Configuration."));
-		D(F("WiFi AP Configuration"));
-		D("");
-		D(String(acConfig.apid));
-		D("PW: " + String(acConfig.psk));
-		// NOTE: don't return yet; let the portal come up for reconfig
-
+		Serial.println(F("WiFi: Reset requested. Clearing WiFi credentials."));
+		wm.resetSettings();
+		WiFi.disconnect(true);
+		delay(200);
+		forcePortal = true;
 		wifiProvisioning = true;
 	}
 	
-	// Restore saved creds if present (BEFORE begin)
-	if (SPIFFS.exists("/ac_credt")) {
-		Serial.println(F("WiFi: Using stored credentials."));
-		restored = Portal.restoreCredential("/ac_credt", SPIFFS);
-		if (!restored) {
-			Serial.println(F("WiFi: Restore Credential failed."));
-		}
-
-		wifiProvisioning = false;
-	} else {
-		acConfig.immediateStart = true;
-		acConfig.autoRise = true;
-
-		Serial.println(F("WiFi: Unconfigured. AP Configuration."));
-		D(F("WiFi AP Configuration"));
-		D("");
-		D(String(acConfig.apid));
-		D("PW: " + String(acConfig.psk));
-
-		wifiProvisioning = true;
-	}
-	
-// 	WiFi.setAutoConnect(true);
-// 	WiFi.setAutoReconnect(true);
-// 	delay(100);
-
-	// Apply config
-	Portal.config(acConfig);
-	
-// 	Serial.println(F("Portal.begin()"));
-// 	Serial.printf("pre-begin: mode=%d st=%d ip=%s\n",
-// 	  (int)WiFi.getMode(),
-// 	  (int)WiFi.status(),
-// 	  WiFi.localIP().toString().c_str());
-// 	Serial.flush();
-
-	bool ok = Portal.begin();
-// 	Serial.printf("Portal.begin(): returned ok=%d\n", ok);
+	// Start WiFi (autoConnect unless forced)
+	bool ok = wifiBegin(forcePortal);
 	if (ok) {
-// 		Portal.saveCredential("/ac_credt", SPIFFS);
 		if (wifiReady()) {
-			Serial.println(F("WiFi IP: ") + WiFi.localIP().toString());
+			Serial.print(F("WiFi IP: "));
+			Serial.println(WiFi.localIP());
 			wifiEverUp = true;
+			wifiProvisioning = false;
 		} else {
-			Serial.println(F("WiFi: Portal started; STA not up yet"));
+			Serial.println(F("WiFi: connected/portal done; STA not up yet"));
 			wifiEverUp = false;
+			wifiProvisioning = true;
 		}
+
+		Server.begin();
 	} else {
 		Serial.println(F("WiFi: Connect failed. Retrying."));
 		wifiNextRetry = millis() + 1000UL;
+		wifiEverUp = false;
+		wifiProvisioning = true;
 	}
 	
-	// If reset button held, you *may* want to keep running (so portal UI works)
-	// If you really want to bail out of the rest of setup when reset held:
+	// Preserve your existing behavior: bail out of rest of setup if reset held
 	if (is_reset == LOW)
 		return;
 	
-// ----------- End WiFi -------------------------------------------------------
+// ----------- Upload -------------------------------------------------------
+
+Server.on("/upload", HTTP_GET, handleUploadPage);
+Server.on("/upload", HTTP_POST, handleUploadPost, handleUploadStream);
+
+// -----------        -------------------------------------------------------
 
 #ifdef USE_DFPLAYER
 	Serial.println(F("DFP: Setup."));
@@ -1676,8 +1859,6 @@ void loop() {
 		ESP.restart();
 	}
 	
-  	Portal.handleClient();
-
 	if (wifiProvisioning) {
 		if (wifiReady()) {
 			wifiProvisioning = false;
@@ -1693,7 +1874,6 @@ void loop() {
 	bool wasUp = wifiEverUp;
 
 	if(!wifiReady()) {
-		wifiSavedCreds = false;
 		wifiEverUp = false;
 
 		// Optional: only log on transition
@@ -1711,14 +1891,13 @@ void loop() {
 		Serial.println(F("WiFi: Available"));
 		wifiEverUp = true;
 		wifiProvisioning = false;
+#if IS_ESP8266
 		WiFi.setAutoConnect(true);
 		WiFi.setAutoReconnect(true);
+#elif IS_ESP32
+		WiFi.setAutoReconnect(true);
+#endif
  		lastMQTTOnlineCheck = 0; // force immediate MQTT attempt
-	}
-
-	if (!wifiSavedCreds) {
-		Portal.saveCredential("/ac_credt", SPIFFS);
-		wifiSavedCreds = true;
 	}
 
 	bool isConnected = client.loop();
@@ -1737,6 +1916,19 @@ void loop() {
 		}
 	}
 
+	Server.handleClient();
+	delay(0);
+
+	if (shouldReboot) {
+		D(F("OTA: Rebooting ..."));
+		delay(2000);
+#if IS_ESP8266
+		ESP.restart();
+#else
+		ESP.restart();
+#endif
+	}
+
 #ifdef USE_DFPLAYER
 	if (dfp.available()) {
 		dfpPrintDetail(dfp.readType(), dfp.read());
@@ -1748,6 +1940,8 @@ void loop() {
 	bool is_reset = digitalRead(PIN_RESET_WIFI);
 	if(!is_reset && !reset_is_down) {
 		reset_is_down = true;
+		D("MQTT Agent, V " + String(VERSION));
+		D("");
 		D("IP: " + WiFi.localIP().toString());
 		D("ID: " + String(systemID));
 		Serial.println("WiFi: IP: " + WiFi.localIP().toString());
