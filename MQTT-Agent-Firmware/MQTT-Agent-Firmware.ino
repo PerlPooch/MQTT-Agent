@@ -60,7 +60,7 @@
 #endif
 
 
-#define VERSION				"2.0"
+#define VERSION				"2.1"
 #define ACCESSPOINT_NAME	"MQA"
 
 #define SCREEN_WIDTH		128		// OLED display width, in pixels
@@ -224,6 +224,12 @@ struct AppConfig {
 	uint16_t	statusUpdateRate;
 };
 AppConfig appConfig;
+
+struct temperature_t {
+	char	address[24];	// "XX:XX:XX:XX:XX:XX:XX:XX" + '\0'
+	float	tempF;
+	bool	valid;
+} ;
 
 // === Upload/Update
 static volatile bool shouldReboot = false;
@@ -766,6 +772,54 @@ static void handleUploadStream()
 }
 
 
+void owAddressToCString(const uint8_t addr[8], char *out)
+{
+	static const char hex[] = "0123456789ABCDEF";
+	uint8_t p = 0;
+
+	for (uint8_t i = 0; i < 8; i++) {
+		out[p++] = hex[(addr[i] >> 4) & 0x0F];
+		out[p++] = hex[addr[i] & 0x0F];
+
+		if (i < 7)
+			out[p++] = ':';
+	}
+
+	out[p] = '\0';
+}
+
+void owInventory() {
+	byte addr[8];
+	int count = 0;
+	char romStr[24];
+
+	oneWire.reset_search();
+
+	while (oneWire.search(addr)) {
+		count++;
+
+		Serial.print("            ");
+		Serial.print("Device[");
+		Serial.print(count);
+		Serial.print("] Address: ");
+
+		owAddressToCString(addr, romStr);
+		Serial.print(romStr);
+
+		if (OneWire::crc8(addr, 7) != addr[7])
+			Serial.print(" (Fail), ");
+		else
+			Serial.print(" (OK), ");
+
+		Serial.print("Family: 0x");
+		if (addr[0] < 16)
+			Serial.print("0");
+		Serial.print(addr[0], HEX);
+
+		Serial.println();
+	}
+}
+
 bool clearRelay(void* opaque) {
 	const size_t relayNum = (size_t)(uintptr_t)opaque;
 	
@@ -786,26 +840,49 @@ bool clearRelay(void* opaque) {
 	return false; // one-shot for SimpleTimer-style callbacks
 }
 
+temperature_t updateTemperature(uint8_t index) {
+	temperature_t r;
 
-String updateTemperature() {
-	float 	temp;
-	char	data[200];
+	r.address[0] = '\0';
+	r.tempF = 0.0f;
+	r.valid = false;
 
 #ifdef USE_1WIRE_TEMPERATURE
+	DeviceAddress a;
+
 	sensors.setWaitForConversion(true);
-	sensors.requestTemperatures(); // Send the command to get temperatures
-	temp = sensors.getTempFByIndex(0);
+	sensors.requestTemperatures();
+
+	r.tempF = sensors.getTempFByIndex(index);
+
+	if (sensors.getAddress(a, index)) {
+		owAddressToCString(a, r.address);
+		r.valid = true;
+	} else {
+		r.valid = false;
+	}
 #elif defined(USE_DHT11_TEMPERATURE)
-	temp = dht.readTemperature(1);
+	(void)index; // unused
+
+	// DHT11 has no 1-Wire ROM address; provide a dummy identifier
+	strcpy(r.address, "DHT11");
+
+	r.tempF = dht.readTemperature(true); // true = Fahrenheit (DHT library)
+	if (!isnan(r.tempF))
+		r.valid = true;
+	else
+		r.tempF = 0.0f
 #else
-	temp = 0.0f;
+	(void)index; // unused
+
+	// No sensor configured
+	strcpy(r.address, "NONE");
+	r.tempF = 0.0f;
+	r.valid = false;
 #endif
 
-	snprintf(data, sizeof(data), "%0.1f", temp);
-
-	return String(data);
+	return r;
 }
-
 
 String updateHumidity() {
 	float 	humidity;
@@ -824,40 +901,83 @@ String updateHumidity() {
 
 bool publishTemperature(void* opaque) {
 	char	data[200];
-	char	buf[64];
+	char	topic[96];
+	char	baseTopic[96];
+	char	key[64];
+	char	idStr[24];			// raw "28:FF:..."
+	char	idStrStripped[17];	// "28FF..." (16 hex + '\0')
 
-// Serial.println(F("publishTemperature()"));
+	(void)opaque;
 
-	String temp = updateTemperature();
-	D(String(F("Temp 0: ")) + temp);
+	if (strlen(appConfig.MQTTBroker) == 0)
+		return true;
 
-	memset(buf, 0, sizeof(buf));
-	strncpy(buf, "spencer/", sizeof(buf));
-	strcat(buf, systemID);
-	strcat(buf, "/temperature");
-	
 	blinkLED((void *)0);
-	
-	if(strlen(appConfig.MQTTBroker) > 0) {
+
+	// Base topic: "spencer/<systemID>/temperature"
+	memset(baseTopic, 0, sizeof(baseTopic));
+	strncpy(baseTopic, "spencer/", sizeof(baseTopic) - 1);
+	strncat(baseTopic, systemID, sizeof(baseTopic) - strlen(baseTopic) - 1);
+	strncat(baseTopic, "/temperature", sizeof(baseTopic) - strlen(baseTopic) - 1);
+
+	uint8_t sensorCount = 1;
+	char	tempStr[16];
+
+#ifdef USE_1WIRE_TEMPERATURE
+	sensorCount = sensors.getDeviceCount();
+	if (sensorCount == 0)
+		sensorCount = 1;
+#endif
+
+	for (uint8_t i = 0; i < sensorCount; i++){
+		temperature_t t = updateTemperature(i);
+
+#ifdef USE_1WIRE_TEMPERATURE
+		strncpy(idStr, t.address, sizeof(idStr) - 1);
+		idStr[sizeof(idStr) - 1] = '\0';
+
+		// Strip ':' → build 16-char hex ID
+		uint8_t p = 0;
+		for(uint8_t j = 0; j < strlen(idStr); j++) {
+			if (idStr[j] != ':' && p < 16)
+				idStrStripped[p++] = idStr[j];
+		}
+		idStrStripped[p] = '\0';
+#else
+		strcpy(idStrStripped, "0");
+#endif
+
+		// Topic
+		memset(topic, 0, sizeof(topic));
+		strncpy(topic, baseTopic, sizeof(topic) - 1);
+
+		if (sensorCount > 1) {
+			strncat(topic, "/", sizeof(topic) - strlen(topic) - 1);
+			strncat(topic, idStrStripped, sizeof(topic) - strlen(topic) - 1);
+		}
+
 		StaticJsonDocument<200> doc;
 
 		doc["id"] = systemID;
-		doc["temperature"] = temp;
 		doc["updateRate"] = (String)appConfig.temperatureUpdateRate;
 
+		snprintf(tempStr, sizeof(tempStr), "%.1f", t.tempF);
+		doc["temperature"] = tempStr;
+
+		memset(data, 0, sizeof(data));
 		serializeJson(doc, data, sizeof(data));
-	
-		if (client.publish(buf, data)) {
-		}
-	
-#ifdef USE_DHT11_TEMPERATURE
-		publishHumidity(0);
-#endif
+		client.publish(topic, data);
+
+// 		D(String(F("T")) + String(i) + F(": ") + String(t.tempF, 1) + F(" -> ") + String(topic));
+ 		D(String(F("T")) + String(i) + F(": ") + String(t.tempF, 1));
 	}
-	
+
+#ifdef USE_DHT11_TEMPERATURE
+	publishHumidity(0);
+#endif
+
 	return true;
 }
-
 
 bool publishHumidity(void* opaque) {
 	char	data[200];
@@ -1275,9 +1395,48 @@ DynamicJsonDocument getStatusAsJSON() {
 	config += "Md ";
 #endif
 #if defined (USE_DHT11_TEMPERATURE) || defined (USE_1WIRE_TEMPERATURE)
-	String	temp = updateTemperature();
-	doc["temperature"] = temp;
+	uint8_t sensorCount = 1;
+	char	tempStr[16];
+	
+#ifdef USE_1WIRE_TEMPERATURE
+	sensorCount = sensors.getDeviceCount();
+	if (sensorCount == 0)
+		sensorCount = 1;
+#endif
 	doc["temperatureUpdateRate"] = (String)appConfig.temperatureUpdateRate;
+
+	for (uint8_t i = 0; i < sensorCount; i++) {
+		temperature_t t = updateTemperature(i);
+
+		if (sensorCount == 1) {
+			snprintf(tempStr, sizeof(tempStr), "%.1f", t.tempF);
+			doc["temperature"] = tempStr;
+		} else {
+			char	key[64];
+			char	idStripped[17];
+#ifdef USE_1WIRE_TEMPERATURE
+			// Strip ':' from "XX:XX:..." into 16-char hex
+			uint8_t p = 0;
+			for (uint8_t j = 0; j < 24 && t.address[j] != '\0'; j++) {
+				if (t.address[j] != ':' && p < 16)
+					idStripped[p++] = t.address[j];
+			}
+			idStripped[p] = '\0';
+#else
+			strcpy(idStripped, "0");
+#endif
+			memset(key, 0, sizeof(key));
+			strncpy(key, "temperature-", sizeof(key) - 1);
+			strncat(key, idStripped, sizeof(key) - strlen(key) - 1);
+
+			snprintf(tempStr, sizeof(tempStr), "%.1f", t.tempF);
+			doc[key] = tempStr;
+		}
+	}
+
+// 	String	temp = updateTemperature();
+// 	doc["temperature"] = temp;
+// 	doc["temperatureUpdateRate"] = (String)appConfig.temperatureUpdateRate;
 #endif
 #ifdef USE_STATUS_0
 	doc["status0"] = (uint8_t)(input0 ? 1 : 0);
@@ -1332,6 +1491,46 @@ void rootPage() {
 			temperatureTimer = timer.every(appConfig.temperatureUpdateRate * 1000, publishTemperature, (void *)0);
 	}	
 	
+	if(Server.hasArg(F("broker"))) 	{
+		String s = Server.arg(F("broker"));	// expects "ip:port" or "ip"
+		s.trim();
+
+		String host = s;
+		uint16_t port = 1883;
+
+		int colon = s.indexOf(':');
+		if (colon >= 0) {
+			host = s.substring(0, colon);
+
+			String p = s.substring(colon + 1);
+			p.trim();
+			if (p.length() > 0)
+				port = (uint16_t)p.toInt();
+		}
+
+		host.trim();
+
+		if (host.length() > 0) {
+			memset(appConfig.MQTTBroker, 0, sizeof(appConfig.MQTTBroker));
+			host.toCharArray(appConfig.MQTTBroker, sizeof(appConfig.MQTTBroker));
+
+			appConfig.MQTTPort = port;
+
+			D(String(F("Set-broker: ")) + host + F(":") + String(appConfig.MQTTPort));
+
+			saveConfiguration(CONFIG_FILE, appConfig);
+		} else {
+			memset(appConfig.MQTTBroker, 0, sizeof(appConfig.MQTTBroker));
+			appConfig.MQTTPort = port;
+
+			D(String(F("Set-broker: none")));;
+
+			saveConfiguration(CONFIG_FILE, appConfig);
+			
+			shouldReboot = true;
+		}
+	}
+
 	if(Server.hasArg(F("set"))) {
 		String state = Server.arg(F("state"));
 		String deviceNum = Server.arg(F("device-num"));
@@ -1696,7 +1895,7 @@ void setup() {
 #ifdef USE_1WIRE_TEMPERATURE
 	sensors.begin();
 #endif
-
+	updateTemperature(0);
 
 	Serial.begin(115200);
 	delay(1000);
@@ -1723,6 +1922,7 @@ void setup() {
 	Serial.println(F("Config: 1-Wire Temperature enabled"));
 	Serial.println(F("Config:   Temperature sensor enabled"));
 	Serial.printf("Config:   %d devices found.\n", sensors.getDeviceCount());
+owInventory();
 #else
 	Serial.println(F("Config: 1-Wire Temperature disabled"));
 #endif
@@ -1880,14 +2080,22 @@ Server.on("/upload", HTTP_POST, handleUploadPost, handleUploadStream);
 }
 
 
-void loop() {
-	if (millis() >= rebootTime) {
+void reboot() {
 		D(F("Rebooting ..."));
 		Serial.println("Rebooting ...");
 
 		delay(3000);
 
+#if IS_ESP8266
 		ESP.restart();
+#else
+		ESP.restart();
+#endif
+}
+
+void loop() {
+	if (millis() >= rebootTime) {
+		reboot();
 	}
 	
 	if (wifiProvisioning) {
@@ -1951,13 +2159,8 @@ void loop() {
 	delay(0);
 
 	if (shouldReboot) {
-		D(F("OTA: Rebooting ..."));
-		delay(2000);
-#if IS_ESP8266
-		ESP.restart();
-#else
-		ESP.restart();
-#endif
+		D(F("Rebooting ..."));
+		reboot();
 	}
 
 #ifdef USE_DFPLAYER
