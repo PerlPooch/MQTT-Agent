@@ -61,7 +61,7 @@
 
 
 #define VERSION				"2.0"
-
+#define ACCESSPOINT_NAME	"MQA"
 
 #define SCREEN_WIDTH		128		// OLED display width, in pixels
 #define SCREEN_HEIGHT		32		// OLED display height, in pixels
@@ -215,7 +215,7 @@ static unsigned long	wifiNextRetry = 0;
 static bool				wifiEverUp = false;
 static bool				wifiProvisioning = false;
 
-static const uint32_t	rebootTime = (uint32_t)((uint32_t)REBOOT_DAYS * MS_PER_DAY);
+static uint32_t	rebootTime = (uint32_t)((uint32_t)REBOOT_DAYS * MS_PER_DAY);
 
 struct AppConfig {
 	char		MQTTBroker[64];
@@ -483,6 +483,15 @@ void saveConfiguration(const char *filename, const AppConfig &config) {
 	file.close();
 }
 
+void configModeCallback(WiFiManager *myWM) {
+  Serial.println("WiFi: Failed to Connect.");
+  Serial.println("WiFi: Portal " + String(myWM->getConfigPortalSSID()));
+
+  D("Failed to Connect.");
+  D(" ");
+  D(String(myWM->getConfigPortalSSID()));
+}
+
 
 static bool wifiBegin(bool forcePortal) {
 	wmShouldSave = false;
@@ -513,10 +522,9 @@ static bool wifiBegin(bool forcePortal) {
 
 	WiFi.mode(WIFI_STA);
 
-	String apName = "OSCR " + String(systemID);
+	char apName[32];
+	snprintf(apName, sizeof(apName), "%s %s", ACCESSPOINT_NAME, systemID);
 	const char* apPass = "12345678";
-
-	wm.setDebugOutput(false);
 
 	static const char wmHead[] PROGMEM = R"rawliteral(
 <style>
@@ -537,18 +545,25 @@ button,input[type=submit]{border-radius:var(--radius);cursor:pointer;background-
 	wm.setCustomHeadElement(wmHead);
 	wm.setDarkMode(true);
 	wm.setTitle("Agent Configuration");
+	wm.setAPCallback(configModeCallback);
+ 	wm.setDebugOutput(false);
 
 	bool ok = false;
 	if(forcePortal) {
-		ok = wm.startConfigPortal(apName.c_str(), apPass);
+		Serial.println(F("WiFi: Start Config Portal"));
+		ok = wm.startConfigPortal(apName, apPass);
 	} else {
-		ok = wm.autoConnect(apName.c_str(), apPass);
+		Serial.println(F("WiFi: Auto Connect"));
+		D(F("Connecting ..."));
+		ok = wm.autoConnect(apName, apPass);
 	}
 
 	if (!ok) {
-		Serial.println(F("WiFiManager: failed to connect / portal exited"));
+		Serial.println(F("WiFiManager: failed to connect, portal exited."));
 		return false;
 	}
+
+	D(F("Connected."));
 
 	// Persist YOUR config model if portal saved
 	if (wmShouldSave) {
@@ -573,6 +588,12 @@ button,input[type=submit]{border-radius:var(--radius);cursor:pointer;background-
 
 
 static bool wifiReady() {
+// Serial.print("wifiReady() ");
+// 	wl_status_t st = (wl_status_t)WiFi.status();
+// 	Serial.printf("WiFi: Retry. st=%s mode=%d.\n",
+// 		wifiStatusStr(st),
+// 		(int)WiFi.getMode());
+
 	if(WiFi.status() != WL_CONNECTED) return false;
 	IPAddress ip = WiFi.localIP();
 
@@ -619,6 +640,10 @@ static void wifiRetryTick() {
 	// Track how long we've been stuck in IDLE
 	if(st == WL_IDLE_STATUS) {
 		if(!wifiIdleSince) wifiIdleSince = now;
+	} else if(st == WL_NO_SSID_AVAIL) {
+		Serial.println(F("WiFi: No SSID. Giving up."));
+		D("Timeout."); 
+		rebootTime = 0; // very in the past. Reboot.
 	} else {
 		wifiIdleSince = 0;
 	}
@@ -767,6 +792,7 @@ String updateTemperature() {
 	char	data[200];
 
 #ifdef USE_1WIRE_TEMPERATURE
+	sensors.setWaitForConversion(true);
 	sensors.requestTemperatures(); // Send the command to get temperatures
 	temp = sensors.getTempFByIndex(0);
 #elif defined(USE_DHT11_TEMPERATURE)
@@ -1696,6 +1722,7 @@ void setup() {
 #ifdef USE_1WIRE_TEMPERATURE
 	Serial.println(F("Config: 1-Wire Temperature enabled"));
 	Serial.println(F("Config:   Temperature sensor enabled"));
+	Serial.printf("Config:   %d devices found.\n", sensors.getDeviceCount());
 #else
 	Serial.println(F("Config: 1-Wire Temperature disabled"));
 #endif
@@ -1810,10 +1837,14 @@ void setup() {
 		Serial.println(F("WiFi: Connect failed. Retrying."));
 		wifiNextRetry = millis() + 1000UL;
 		wifiEverUp = false;
-		wifiProvisioning = true;
+		wifiProvisioning = false;
 	}
 	
-	// Preserve your existing behavior: bail out of rest of setup if reset held
+	// Bail if we failed WiFi.
+	if(!wifiEverUp) 
+		return;
+		
+	// Bail out of rest of setup if reset held
 	if (is_reset == LOW)
 		return;
 	
