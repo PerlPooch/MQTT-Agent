@@ -151,6 +151,7 @@
 #define ONLINE_CHECK_PERIOD 	10000	// Time(ms) between checks to see if we're still online
 #define REBOOT_DAYS				7		// Reboot every N days
 #define WIFI_RETRY_PERIOD		10000UL	// Time(ms) between WiFi connection retries
+#define REBOOT_BUTTON_TIME		10000	// Time(ms) WiFi button down to cause Reboot
 
 #ifdef RELAY_POSITIVE_LOGIC
 	#define LOGIC_HIGH 1
@@ -210,6 +211,7 @@ Timer<>::Task		dfplayerTimer;
 
 auto					timer = timer_create_default();
 unsigned long			lastMQTTOnlineCheck;
+static unsigned long	rebootPressedTime = 0;
 static uint32_t			wifiIdleSince = 0;
 static unsigned long	wifiNextRetry = 0;
 static bool				wifiEverUp = false;
@@ -1072,6 +1074,36 @@ bool publishStatus(void* opaque) {
 	
 	if(strlen(appConfig.MQTTBroker) > 0) {
 		DynamicJsonDocument doc = getStatusAsJSON();
+
+		serializeJson(doc, data, sizeof(data));
+
+		if (client.publish(buf, data)) {
+		}
+	}
+		
+	return true;
+}
+
+
+bool publishReboot(void* opaque) {
+	char	data[400];
+	char	buf[64];
+
+	bool	input0 = false;
+	bool	input1 = false;
+
+	memset(buf, 0, sizeof(buf));
+	strncpy(buf, "spencer/", sizeof(buf));
+	strcat(buf, systemID);
+	strcat(buf, "/reboot");
+	
+	blinkLED((void *)0);
+	
+	if(strlen(appConfig.MQTTBroker) > 0) {
+		StaticJsonDocument<200> doc;
+
+		doc["id"] = systemID;
+		doc["uptime"] = millis();
 
 		serializeJson(doc, data, sizeof(data));
 
@@ -2129,20 +2161,25 @@ Server.on("/upload", HTTP_POST, handleUploadPost, handleUploadStream);
 
 
 void reboot() {
-		D(F("Rebooting ..."));
-		Serial.println("Rebooting ...");
+	D(F("Rebooting ..."));
+	Serial.println("Rebooting ...");
+	publishReboot(nullptr);
 
-		delay(3000);
+	delay(3000);
 
 #if IS_ESP8266
-		ESP.restart();
+	ESP.restart();
 #else
-		ESP.restart();
+	ESP.restart();
 #endif
 }
 
 void loop() {
 	if (millis() >= rebootTime) {
+		reboot();
+	}
+	// Button Down
+	if (rebootPressedTime > 0 && (long)(millis() - rebootPressedTime) >= 0) {
 		reboot();
 	}
 	
@@ -2222,6 +2259,7 @@ void loop() {
 	bool is_reset = digitalRead(PIN_RESET_WIFI);
 	if(!is_reset && !reset_is_down) {
 		reset_is_down = true;
+		rebootPressedTime = millis() + REBOOT_BUTTON_TIME;
 		D("MQTT Agent, V " + String(VERSION));
 		D("");
 		D("IP: " + WiFi.localIP().toString());
@@ -2231,6 +2269,7 @@ void loop() {
 	is_reset = digitalRead(PIN_RESET_WIFI);
 	if(is_reset && reset_is_down) {
 		reset_is_down = false;
+		rebootPressedTime = 0;
 	}
 	
 #ifdef USE_STATUS_0
