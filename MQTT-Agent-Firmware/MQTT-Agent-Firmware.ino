@@ -60,7 +60,7 @@
 #endif
 
 
-#define VERSION				"2.1"
+#define VERSION				"2.2"
 #define ACCESSPOINT_NAME	"MQA"
 
 #define SCREEN_WIDTH		128		// OLED display width, in pixels
@@ -903,7 +903,6 @@ bool publishTemperature(void* opaque) {
 	char	data[200];
 	char	topic[96];
 	char	baseTopic[96];
-	char	key[64];
 	char	idStr[24];			// raw "28:FF:..."
 	char	idStrStripped[17];	// "28FF..." (16 hex + '\0')
 
@@ -912,7 +911,7 @@ bool publishTemperature(void* opaque) {
 	if (strlen(appConfig.MQTTBroker) == 0)
 		return true;
 
-	blinkLED((void *)0);
+	blinkLED(nullptr);
 
 	// Base topic: "spencer/<systemID>/temperature"
 	memset(baseTopic, 0, sizeof(baseTopic));
@@ -920,17 +919,26 @@ bool publishTemperature(void* opaque) {
 	strncat(baseTopic, systemID, sizeof(baseTopic) - strlen(baseTopic) - 1);
 	strncat(baseTopic, "/temperature", sizeof(baseTopic) - strlen(baseTopic) - 1);
 
+	// Single-sensor topic is exactly baseTopic
+    const char* legacyTopic = baseTopic;
+
 	uint8_t sensorCount = 1;
 	char	tempStr[16];
-
+	temperature_t averageTemp;
+	
 #ifdef USE_1WIRE_TEMPERATURE
 	sensorCount = sensors.getDeviceCount();
 	if (sensorCount == 0)
-		sensorCount = 1;
+		return true;
+
+	averageTemp.tempF = 0.0f;
 #endif
 
 	for (uint8_t i = 0; i < sensorCount; i++){
 		temperature_t t = updateTemperature(i);
+		
+		if(sensorCount > 1)
+			averageTemp.tempF += t.tempF;
 
 #ifdef USE_1WIRE_TEMPERATURE
 		strncpy(idStr, t.address, sizeof(idStr) - 1);
@@ -948,30 +956,57 @@ bool publishTemperature(void* opaque) {
 #endif
 
 		// Topic
-		memset(topic, 0, sizeof(topic));
-		strncpy(topic, baseTopic, sizeof(topic) - 1);
+		const char* publishTopic = legacyTopic;
 
 		if (sensorCount > 1) {
-			strncat(topic, "/", sizeof(topic) - strlen(topic) - 1);
-			strncat(topic, idStrStripped, sizeof(topic) - strlen(topic) - 1);
-		}
+			// Build per-sensor topic safely
+			snprintf(topic, sizeof(topic), "%s/%s", baseTopic, idStrStripped);
+			publishTopic = topic;
+        }
 
+		// Payload
 		StaticJsonDocument<200> doc;
-
 		doc["id"] = systemID;
 		doc["updateRate"] = (String)appConfig.temperatureUpdateRate;
-
+		
 		snprintf(tempStr, sizeof(tempStr), "%.1f", t.tempF);
 		doc["temperature"] = tempStr;
-
+		
 		memset(data, 0, sizeof(data));
 		serializeJson(doc, data, sizeof(data));
+		
+		// Publish
+		client.publish(publishTopic, data);
+		
+		// ALSO publish sensor 0 as /temperature
+		if (sensorCount > 1 && i == 0) {
+			client.publish(legacyTopic, data);
+		}
+		
+		// D(String(F("T")) + String(i) + F(": ") + String(t.tempF, 1) + F(" -> ") + String(publishTopic));
+		D(String(F("T")) + String(i) + F(": ") + String(t.tempF, 1));
+    }
+
+	if(sensorCount > 1) {
+		averageTemp.tempF /= sensorCount;
+	
+		StaticJsonDocument<200> doc;
+	
+		doc["id"] = systemID;
+		doc["updateRate"] = (String)appConfig.temperatureUpdateRate;
+	
+		snprintf(tempStr, sizeof(tempStr), "%.1f", averageTemp.tempF);
+		doc["temperature"] = tempStr;
+	
+		memset(data, 0, sizeof(data));
+		serializeJson(doc, data, sizeof(data));
+
+		snprintf(topic, sizeof(topic), "%s/Average", baseTopic);
 		client.publish(topic, data);
-
-// 		D(String(F("T")) + String(i) + F(": ") + String(t.tempF, 1) + F(" -> ") + String(topic));
- 		D(String(F("T")) + String(i) + F(": ") + String(t.tempF, 1));
+		
+		D(String(F("Ta: ")) + String(averageTemp.tempF, 1));
 	}
-
+		
 #ifdef USE_DHT11_TEMPERATURE
 	publishHumidity(0);
 #endif
@@ -1405,8 +1440,14 @@ DynamicJsonDocument getStatusAsJSON() {
 #endif
 	doc["temperatureUpdateRate"] = (String)appConfig.temperatureUpdateRate;
 
+	temperature_t	averageTemp;
+	averageTemp.tempF = 0.0f;
+
 	for (uint8_t i = 0; i < sensorCount; i++) {
 		temperature_t t = updateTemperature(i);
+
+		// Sum for average (works for 1 or many)
+		averageTemp.tempF += t.tempF;
 
 		if (sensorCount == 1) {
 			snprintf(tempStr, sizeof(tempStr), "%.1f", t.tempF);
@@ -1434,6 +1475,13 @@ DynamicJsonDocument getStatusAsJSON() {
 		}
 	}
 
+	// Average
+	if (sensorCount > 0) {
+		averageTemp.tempF /= (float)sensorCount;
+		snprintf(tempStr, sizeof(tempStr), "%.1f", averageTemp.tempF);
+		doc["temperatureAverage"] = tempStr;	// name as you prefer
+	}
+	
 // 	String	temp = updateTemperature();
 // 	doc["temperature"] = temp;
 // 	doc["temperatureUpdateRate"] = (String)appConfig.temperatureUpdateRate;
