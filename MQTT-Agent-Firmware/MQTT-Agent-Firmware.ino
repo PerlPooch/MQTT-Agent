@@ -1,4 +1,5 @@
 #include "MDS_Platform.h"
+#include "uiHtml.h"
 
 // ---- Configuration -------------------------------------------------------------------
 //
@@ -6,15 +7,15 @@
 // STATUS_1 and DFPlayer are mutually exclusive
 #define USE_STATUS_1
 #define INVERT_STATUS
-// #define USE_RELAY_0
+#define USE_RELAY_0
 // RELAY_1 and DFPlayer are mutually exclusive
-// #define USE_RELAY_1
+#define USE_RELAY_1
 // #define USE_DFPLAYER
 // #define PLAY_TRIGGER_RELAY_0
 // #define USE_MIDI
 #define RELAY_POSITIVE_LOGIC
 // #define RELAY_NEGATIVE_LOGIC
-#define USE_1WIRE_TEMPERATURE
+// #define USE_1WIRE_TEMPERATURE
 // #define USE_DHT11_TEMPERATURE
 // #define ROTATE_DISPLAY
 //
@@ -60,7 +61,7 @@
 #endif
 
 
-#define VERSION				"2.2"
+#define VERSION				"2.3"
 #define ACCESSPOINT_NAME	"MQA"
 
 #define SCREEN_WIDTH		128		// OLED display width, in pixels
@@ -240,6 +241,9 @@ static void handleUploadPage();
 static void handleUploadPost();
 static void handleUploadStream();
 
+// === UI
+static void uiPage();
+
 // === WiFi Manager
 static 					WiFiManager wm;
 static bool 			wmShouldSave = false;
@@ -306,6 +310,49 @@ bool lastStatus0 = false, lastStatus1 = false;
 bool reset_is_down = false;
 
 
+static String getBuildDate() {
+	const char *date = __DATE__;	// "Mmm dd yyyy"
+	const char *time = __TIME__;	// "hh:mm:ss"
+
+	char month[4];
+	char day[3];
+	char year[5];
+	char iso[20];
+
+	month[0] = date[0];
+	month[1] = date[1];
+	month[2] = date[2];
+	month[3] = '\0';
+
+	day[0] = (date[4] == ' ') ? '0' : date[4];
+	day[1] = date[5];
+	day[2] = '\0';
+
+	year[0] = date[7];
+	year[1] = date[8];
+	year[2] = date[9];
+	year[3] = date[10];
+	year[4] = '\0';
+
+	const char *monthNum = "00";
+
+	if(strcmp(month, "Jan") == 0) monthNum = "01";
+	else if(strcmp(month, "Feb") == 0) monthNum = "02";
+	else if(strcmp(month, "Mar") == 0) monthNum = "03";
+	else if(strcmp(month, "Apr") == 0) monthNum = "04";
+	else if(strcmp(month, "May") == 0) monthNum = "05";
+	else if(strcmp(month, "Jun") == 0) monthNum = "06";
+	else if(strcmp(month, "Jul") == 0) monthNum = "07";
+	else if(strcmp(month, "Aug") == 0) monthNum = "08";
+	else if(strcmp(month, "Sep") == 0) monthNum = "09";
+	else if(strcmp(month, "Oct") == 0) monthNum = "10";
+	else if(strcmp(month, "Nov") == 0) monthNum = "11";
+	else if(strcmp(month, "Dec") == 0) monthNum = "12";
+
+	snprintf(iso, sizeof(iso), "%s-%s-%sT%.8s", year, monthNum, day, time);
+
+	return String(iso);
+}
 
 #ifdef USE_DFPLAYER
 void dfpPrintDetail(uint8_t type, int value) {
@@ -791,6 +838,7 @@ void owAddressToCString(const uint8_t addr[8], char *out)
 }
 
 void owInventory() {
+#ifdef USE_1WIRE_TEMPERATURE
 	byte addr[8];
 	int count = 0;
 	char romStr[24];
@@ -820,6 +868,7 @@ void owInventory() {
 
 		Serial.println();
 	}
+#endif
 }
 
 bool clearRelay(void* opaque) {
@@ -986,7 +1035,9 @@ bool publishTemperature(void* opaque) {
 		}
 		
 		// D(String(F("T")) + String(i) + F(": ") + String(t.tempF, 1) + F(" -> ") + String(publishTopic));
+#ifdef USE_1WIRE_TEMPERATURE
 		D(String(F("T")) + String(i) + F(": ") + String(t.tempF, 1));
+#endif
     }
 
 	if(sensorCount > 1) {
@@ -1397,6 +1448,7 @@ DynamicJsonDocument getStatusAsJSON() {
 	DynamicJsonDocument doc(512);
 
 	doc["version"] = String(VERSION);
+	doc["build"] = getBuildDate();
 
 	if (WiFi.status() == WL_CONNECTED) {
 		long rssi = WiFi.RSSI();
@@ -1545,6 +1597,30 @@ DynamicJsonDocument getStatusAsJSON() {
 	return doc;
 }
 
+static void uiPage() {
+	if(!wifiEverUp) return;
+
+	Server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+	Server.sendHeader("Pragma", "no-cache");
+	Server.sendHeader("Expires", "0");
+	Server.sendHeader("X-Content-Type-Options", "nosniff");
+	Server.sendHeader("X-Frame-Options", "DENY");
+	Server.sendHeader("Referrer-Policy", "no-referrer");
+	Server.sendHeader(
+		"Content-Security-Policy",
+		"default-src 'self'; "
+		"script-src 'self' 'unsafe-inline'; "
+		"style-src 'self' 'unsafe-inline'; "
+		"img-src 'self' data:; "
+		"connect-src 'self'; "
+		"object-src 'none'; "
+		"base-uri 'none'; "
+		"frame-ancestors 'none'; "
+		"form-action 'self'"
+	);
+	
+	Server.send_P(200, "text/html; charset=utf-8", uiHtml);
+}
 
 void rootPage() {
 	if(!wifiEverUp) return;
@@ -1795,7 +1871,9 @@ void welcome() {
 
 	Serial.print(F("MQTT Agent, V "));
 	Serial.print(VERSION); 
-	Serial.println(F(". Copyright (C) 2026, Marc D. Spencer")); 
+	Serial.print(" (");
+	Serial.print(getBuildDate());
+	Serial.println(F("). Copyright (C) 2026, Marc D. Spencer")); 
 
 	display.print(F("MQTT Agent, V"));
 	display.println(VERSION); 
@@ -2086,7 +2164,8 @@ owInventory();
 // ----------- WiFi -----------------------------------------------------------
 
 	Server.on("/", rootPage);
-	
+	Server.on("/ui", uiPage);
+
 	// Reset button logic: if held, force portal + clear stored WiFi creds
 	bool forcePortal = false;
 	if (is_reset == LOW) {
