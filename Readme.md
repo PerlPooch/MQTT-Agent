@@ -10,7 +10,7 @@
 
 	{
 		"command": "fetch"|"set-rate"|"set"
-		"rate": int: seconds between updates
+		"rate": int: seconds between updates|duration
 		"device-num": int: 0-based index of device 
 		"state": "on"|"off"|"pulse"
 	}
@@ -20,7 +20,7 @@
 		Causes agent to publish information for <device>
 
 	command == "set-rate"
-		Sets update rate for <device> to rate in rate. <device> can be temperature or status
+		Sets update rate for <device> to rate in rate. <device> can be temperature, status or relay
 
 	command == "set"
 		Sets <device> at index device-num to state. <device> can be relay. <state> can be on, off, or pulse.
@@ -41,6 +41,9 @@
 
 	spencer/FC:F5:C4:AB:56:24/relay {"command":"set", "device-num":"0", "state":"pulse"}
 		Pulse relay 0
+
+	spencer/FC:F5:C4:AB:56:24/relay {"command":"set-rate", "rate":"200"}
+		Set relay pulse duration to 100ms
 
 	spencer/FC:F5:C4:AB:56:24/temperature {"command":"fetch"}
 		Request publish of temperature
