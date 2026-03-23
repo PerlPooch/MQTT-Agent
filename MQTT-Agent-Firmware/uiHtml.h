@@ -173,6 +173,12 @@ static const char uiHtml[] PROGMEM = R"UIHTML(
 				<button id="saveStatusRate">Save</button>
 			</div>
 	
+			<div class="row">
+				<label for="relayPulseDuration">Relay Pulse Duration</label>
+				<input id="relayPulseDuration" type="number" min="0" step="1">
+				<button id="savePulseDuration">Save</button>
+			</div>
+	
 			<div class="row" id="tempRateRow">
 				<label for="temperatureUpdateRate">Temperature Update Rate</label>
 				<input id="temperatureUpdateRate" type="number" min="0" step="1">
@@ -389,6 +395,7 @@ static const char uiHtml[] PROGMEM = R"UIHTML(
 				"humidity",
 				"temperatureUpdateRate",
 				"statusUpdateRate",
+				"relayPulseDuration",
 				"broker",
 				"brokerPort",
 				"uptime"
@@ -411,6 +418,13 @@ static const char uiHtml[] PROGMEM = R"UIHTML(
 
 			if (Object.prototype.hasOwnProperty.call(data, "statusUpdateRate")) {
 				document.getElementById("statusUpdateRate").value = parseInt(data.statusUpdateRate, 10) || 0;
+			}
+
+			if (Object.prototype.hasOwnProperty.call(data, "relayPulseDuration")) {
+				document.getElementById("relayPulseDuration").value = parseInt(data.relayPulseDuration, 10) || 0;
+				document.getElementById("relayPulseDuration").classList.remove("hidden");
+			} else {
+				document.getElementById("relayPulseDuration").classList.add("hidden");
 			}
 
 			if (Object.prototype.hasOwnProperty.call(data, "temperatureUpdateRate")) {
@@ -491,6 +505,19 @@ static const char uiHtml[] PROGMEM = R"UIHTML(
 			}
 		}
 
+		async function savePulseDuration() {
+			const value = document.getElementById("relayPulseDuration").value;
+			setUpdateLamp("busy", "Saving relay pulse duration ...");
+
+			try {
+				const data = await fetchStatus({ relayPulseDuration: value });
+				renderStatus(data);
+				setUpdateLampWithTimeout("on", "Updated.", 1500);
+			} catch (err) {
+				setUpdateLamp("error", "Update failed: " + err.message);
+			}
+		}
+
 		async function saveTempRate() {
 			const value = document.getElementById("temperatureUpdateRate").value;
 			setUpdateLamp("busy", "Saving temperature update rate ...");
@@ -535,6 +562,7 @@ static const char uiHtml[] PROGMEM = R"UIHTML(
 
 
 		document.getElementById("saveStatusRate").addEventListener("click", saveStatusRate);
+		document.getElementById("savePulseDuration").addEventListener("click", savePulseDuration);
 		document.getElementById("saveTempRate").addEventListener("click", saveTempRate);
 		document.getElementById("saveBroker").addEventListener("click", saveBroker);
 

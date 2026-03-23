@@ -6,15 +6,15 @@
 #define USE_STATUS_0
 // STATUS_1 and DFPlayer are mutually exclusive
 #define USE_STATUS_1
-#define INVERT_STATUS
+// #define INVERT_STATUS
 #define USE_RELAY_0
 // RELAY_1 and DFPlayer are mutually exclusive
 #define USE_RELAY_1
 // #define USE_DFPLAYER
 // #define PLAY_TRIGGER_RELAY_0
 // #define USE_MIDI
-#define RELAY_POSITIVE_LOGIC
-// #define RELAY_NEGATIVE_LOGIC
+// #define RELAY_POSITIVE_LOGIC
+#define RELAY_NEGATIVE_LOGIC
 // #define USE_1WIRE_TEMPERATURE
 // #define USE_DHT11_TEMPERATURE
 // #define ROTATE_DISPLAY
@@ -142,10 +142,10 @@
 #define	DEFAULT_MQTT_PORT		1883
 #define	DEFAULT_TEMP_RATE		10
 #define	DEFAULT_STATUS_RATE		60
+#define	DEFAULT_RELAY_PULSE		500		// Time(ms) for relay pulses
 
 #define	DISPLAY_TIMEOUT			5000	// Time(ms) between each display scroll
 #define	DISPLAY_LINES			4		// Number of text lines that fit on the display
-#define	RELAY_TIMEOUT			500 	// Time(ms) for relay pulses
 #define	HAPPY_PERIOD			5000	// Time(ms) for happy LED blinks
 #define	HAPPY_NOMQTT_PERIOD		10000	// Time(ms) for happy LED blinks
 #define	DFPLAYER_RESET			3600	// Time(s) between resetting DFPlayer
@@ -155,11 +155,11 @@
 #define REBOOT_BUTTON_TIME		10000	// Time(ms) WiFi button down to cause Reboot
 
 #ifdef RELAY_POSITIVE_LOGIC
-	#define LOGIC_HIGH 1
-	#define LOGIC_LOW 0
+	#define R_LOGIC_HIGH 1
+	#define R_LOGIC_LOW 0
 #else
-	#define LOGIC_HIGH 0
-	#define LOGIC_LOW 1
+	#define R_LOGIC_HIGH 0
+	#define R_LOGIC_LOW 1
 #endif
 
 #define MS_PER_DAY				(24UL * 60UL * 60UL * 1000UL)
@@ -225,6 +225,7 @@ struct AppConfig {
 	uint16_t	MQTTPort;
 	uint16_t	temperatureUpdateRate;
 	uint16_t	statusUpdateRate;
+	uint16_t	relayPulseDuration;
 };
 AppConfig appConfig;
 
@@ -256,6 +257,7 @@ static void wmSaveCallback() {
 static char wmMqttPort[6];     // "65535" + NUL
 static char wmTempRate[6];
 static char wmStatusRate[6];
+static char wmRelayPulse[6];
 
 static WiFiManagerParameter pMqttBroker(
 	"mqttBroker",
@@ -285,6 +287,13 @@ static WiFiManagerParameter pStatusRate(
 	sizeof(wmStatusRate)
 );
 
+static WiFiManagerParameter pRelayDuration(
+	"relayDuration",
+	"Relay Pulse (ms)",
+	wmRelayPulse,
+	sizeof(wmRelayPulse)
+);
+
 static uint16_t parseU16(const char* s, uint16_t def) {
 	if(!s || !*s) return def;
 
@@ -299,6 +308,7 @@ static void normalizeAppConfigDefaults() {
 	if(appConfig.MQTTPort == 0) appConfig.MQTTPort = DEFAULT_MQTT_PORT;
 	if(appConfig.temperatureUpdateRate == 0) appConfig.temperatureUpdateRate = DEFAULT_TEMP_RATE;
 	if(appConfig.statusUpdateRate == 0) appConfig.statusUpdateRate = DEFAULT_STATUS_RATE;
+	if(appConfig.relayPulseDuration == 0) appConfig.relayPulseDuration = DEFAULT_RELAY_PULSE;
 }
 
 struct Screen {
@@ -392,7 +402,7 @@ void dfpPrintDetail(uint8_t type, int value) {
 			D("Play " + String(value) + " finished.");
 #ifdef PLAY_TRIGGER_RELAY_0
 			delay(200);
-			digitalWrite(PIN_RELAY_0, LOGIC_LOW);
+			digitalWrite(PIN_RELAY_0, R_LOGIC_LOW);
 #endif
 #ifdef USE_MIDI
 			midiA.sendNoteOff(61, 0, 1);     // Stop the note
@@ -502,6 +512,10 @@ bool loadConfiguration(const char *filename, AppConfig &config) {
 
 			config.statusUpdateRate = doc["statusUpdateRate"];
 //			if(config.statusUpdateRate == NULL) config.statusUpdateRate = 1;
+
+			config.relayPulseDuration = doc["relayPulseDuration"];
+			if(config.relayPulseDuration < 100) config.relayPulseDuration = 100;
+			if(config.relayPulseDuration > 60000) config.relayPulseDuration = 60000;
 		} 
 
 		file.close();
@@ -528,6 +542,7 @@ void saveConfiguration(const char *filename, const AppConfig &config) {
 	doc["MQTTPort"] = config.MQTTPort;
 	doc["temperatureUpdateRate"] = config.temperatureUpdateRate;
 	doc["statusUpdateRate"] = config.statusUpdateRate;
+	doc["relayPulseDuration"] = config.relayPulseDuration;
 
 	serializeJsonPretty(doc, Serial);
 
@@ -553,13 +568,15 @@ static bool wifiBegin(bool forcePortal) {
 
 	normalizeAppConfigDefaults();
 
-	uint16_t portForUi   = appConfig.MQTTPort;
-	uint16_t tempForUi   = appConfig.temperatureUpdateRate;
-	uint16_t statusForUi = appConfig.statusUpdateRate;
-	
+	uint16_t portForUi		= appConfig.MQTTPort;
+	uint16_t tempForUi		= appConfig.temperatureUpdateRate;
+	uint16_t statusForUi	= appConfig.statusUpdateRate;
+	uint16_t relayPDForUI	= appConfig.relayPulseDuration;
+
 	snprintf(wmMqttPort,   sizeof(wmMqttPort),   "%u", (unsigned)portForUi);
 	snprintf(wmTempRate,   sizeof(wmTempRate),   "%u", (unsigned)tempForUi);
 	snprintf(wmStatusRate, sizeof(wmStatusRate), "%u", (unsigned)statusForUi);
+	snprintf(wmRelayPulse, sizeof(wmRelayPulse), "%u", (unsigned)relayPDForUI);
 
 	// Fresh manager state each time we enter provisioning
 	wm.setSaveConfigCallback(wmSaveCallback);
@@ -620,7 +637,7 @@ button,input[type=submit]{border-radius:var(--radius);cursor:pointer;background-
 
 	D(F("Connected."));
 
-	// Persist YOUR config model if portal saved
+	// Persist config model if portal saved
 	if (wmShouldSave) {
 		strlcpy(appConfig.MQTTBroker,
 		        pMqttBroker.getValue(),
@@ -634,6 +651,12 @@ button,input[type=submit]{border-radius:var(--radius);cursor:pointer;background-
 
 		appConfig.statusUpdateRate =
 			parseU16(pStatusRate.getValue(), DEFAULT_STATUS_RATE);
+
+		// parseU16 limits the upper bound to 65535
+		appConfig.relayPulseDuration =
+			parseU16(pRelayDuration.getValue(), DEFAULT_RELAY_PULSE);
+		if(appConfig.relayPulseDuration < 100) appConfig.relayPulseDuration = 100;
+		if(appConfig.relayPulseDuration > 60000) appConfig.relayPulseDuration = 60000;
 
 		saveConfiguration(CONFIG_FILE, appConfig);
 	}
@@ -887,7 +910,7 @@ bool clearRelay(void* opaque) {
 		return false;
 	}
 	
-	digitalWrite(relayPin, LOGIC_LOW);
+	digitalWrite(relayPin, R_LOGIC_LOW);
 	return false; // one-shot for SimpleTimer-style callbacks
 }
 
@@ -1360,6 +1383,12 @@ void callback(char* in_topic, byte* in_message, unsigned int length) {
  			timer.cancel(statusTimer);
  			if(appConfig.statusUpdateRate > 0)
  				statusTimer = timer.every(appConfig.statusUpdateRate * 1000, publishStatus, (void *)0);
+		} else if(device == "relay") {
+ 			appConfig.relayPulseDuration = rate.toInt();
+			if(appConfig.relayPulseDuration < 100) appConfig.relayPulseDuration = 100;
+			if(appConfig.relayPulseDuration > 60000) appConfig.relayPulseDuration = 60000;
+ 			D("Set-rate RDur: " + String(appConfig.relayPulseDuration));
+ 			saveConfiguration(CONFIG_FILE, appConfig);
 		}
  	} else if(command == "set") {
 		jsonValue = doc["device-num"] | "";
@@ -1397,18 +1426,18 @@ void callback(char* in_topic, byte* in_message, unsigned int length) {
 				blinkLED((void *)0);
 				D("Set Relay " + deviceNum + " On");
 
-				digitalWrite(relay, LOGIC_HIGH);
+				digitalWrite(relay, R_LOGIC_HIGH);
 			} else if(state == "off") {
 				blinkLED((void *)0);
 				D("Set Relay " + deviceNum + " Off");
 
-				digitalWrite(relay, LOGIC_LOW);
+				digitalWrite(relay, R_LOGIC_LOW);
 			} else if(state == "pulse") {
 				blinkLED((void *)0);
 				D("Set Relay " + deviceNum + " Pulse");
 
-				digitalWrite(relay, LOGIC_HIGH);
-				timer.in(RELAY_TIMEOUT, clearRelay, (void *)deviceNum.toInt());
+				digitalWrite(relay, R_LOGIC_HIGH);
+				timer.in(appConfig.relayPulseDuration, clearRelay, (void *)deviceNum.toInt());
 			}
 		}
  	} else if(command == "play") {
@@ -1427,7 +1456,7 @@ void callback(char* in_topic, byte* in_message, unsigned int length) {
 		midiA.sendNoteOn(61, 127, 1);    // Send a Note (pitch 42, velo 127 on channel 1)
 #endif
 #ifdef PLAY_TRIGGER_RELAY_0
-		digitalWrite(PIN_RELAY_0, LOGIC_HIGH);
+		digitalWrite(PIN_RELAY_0, R_LOGIC_HIGH);
 #endif
 #if defined (PLAY_TRIGGER_RELAY_0) || defined (USE_MIDI)
 		delay(200);
@@ -1586,6 +1615,9 @@ DynamicJsonDocument getStatusAsJSON() {
 	doc["statusUpdateRate"] = (String)appConfig.statusUpdateRate;
 	doc["broker"] = (String)appConfig.MQTTBroker;
 	doc["brokerPort"] = (String)appConfig.MQTTPort;
+#if defined(USE_RELAY_0) || defined(USE_RELAY_1)
+	doc["relayPulseDuration"] = (String)appConfig.relayPulseDuration;
+#endif
 #if defined(USE_DHT11_TEMPERATURE)
 	String	humid = updateHumidity();
 	doc["humidity"] = humid;
@@ -1637,6 +1669,16 @@ void rootPage() {
 		if(appConfig.statusUpdateRate > 0)
 			statusTimer = timer.every(appConfig.statusUpdateRate * 1000, publishStatus, (void *)0);
 	}
+
+#if defined(USE_RELAY_0) || defined(USE_RELAY_1)
+	if(Server.hasArg(F("relayPulseDuration"))) {
+		long pulse = Server.arg(F("relayPulseDuration")).toInt();
+		pulse = constrain(pulse, 100L, 60000L);
+		appConfig.relayPulseDuration = (uint16_t)pulse;
+		D("Set-rate RDur: " + String(appConfig.relayPulseDuration));
+		saveConfiguration(CONFIG_FILE, appConfig);
+	}
+#endif
 
 	if(Server.hasArg(F("temperatureUpdateRate"))) {
 		appConfig.temperatureUpdateRate = Server.arg(F("temperatureUpdateRate")).toInt();
@@ -1708,18 +1750,18 @@ void rootPage() {
 				blinkLED((void *)0);
 				D("Set Relay " + deviceNum + " On");
 
-				digitalWrite(relay, LOGIC_HIGH);
+				digitalWrite(relay, R_LOGIC_HIGH);
 			} else if(state == "off") {
 				blinkLED((void *)0);
 				D("Set Relay " + deviceNum + " Off");
 
-				digitalWrite(relay, LOGIC_LOW);
+				digitalWrite(relay, R_LOGIC_LOW);
 			} else if(state == "pulse") {
 				blinkLED((void *)0);
 				D("Set Relay " + deviceNum + " Pulse");
 
-				digitalWrite(relay, LOGIC_HIGH);
-				timer.in(RELAY_TIMEOUT, clearRelay, (void *)deviceNum.toInt());
+				digitalWrite(relay, R_LOGIC_HIGH);
+				timer.in(appConfig.relayPulseDuration, clearRelay, (void *)deviceNum.toInt());
 			}
 	}	
 	
@@ -2011,12 +2053,12 @@ void setup() {
 	
 #if defined (USE_RELAY_0) || defined (PLAY_TRIGGER_RELAY_0)
 	pinMode(PIN_RELAY_0, OUTPUT);
-	digitalWrite(PIN_RELAY_0, LOGIC_LOW);
+	digitalWrite(PIN_RELAY_0, R_LOGIC_LOW);
 #endif
 
 #ifdef USE_RELAY_1
 	pinMode(PIN_RELAY_1, OUTPUT);
-	digitalWrite(PIN_RELAY_1, LOGIC_LOW);
+	digitalWrite(PIN_RELAY_1, R_LOGIC_LOW);
 #else
 	#if IS_ESP8266
  	pinMode(PIN_LED_1, OUTPUT);
