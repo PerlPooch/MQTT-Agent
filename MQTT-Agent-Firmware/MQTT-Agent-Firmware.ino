@@ -1,4 +1,5 @@
 #include "MDS_Platform.h"
+#include "MDS_Display.h"
 #include "uiHtml.h"
 
 // ---- Configuration -------------------------------------------------------------------
@@ -40,10 +41,7 @@
 #include <arduino-timer.h>
 #include <FS.h>
 #include <LittleFS.h>
-#include <SPI.h>
 #include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
 #ifdef USE_DHT11_TEMPERATURE
 #include "DHT.h"
 #endif
@@ -200,10 +198,9 @@ MIDI_CREATE_INSTANCE(SoftwareSerial, mySerial, midiA);
 WiFiClient 			wifiClient;
 PubSubClient 		client(wifiClient);
 
-Adafruit_SSD1306	display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+MDS_Display			mdsDisplay(SCREEN_WIDTH, SCREEN_HEIGHT, OLED_RESET, &Wire, DISPLAY_LINES, DISPLAY_TIMEOUT);
 
 Timer<>::Task		happyBlinkTimer;
-Timer<>::Task		scrollTimer;
 Timer<>::Task		temperatureTimer;
 Timer<>::Task		statusTimer;
 #ifdef USE_DFPLAYER
@@ -227,7 +224,13 @@ struct AppConfig {
 	uint16_t	statusUpdateRate;
 	uint16_t	relayPulseDuration;
 };
-AppConfig appConfig;
+AppConfig appConfig = {
+	"",
+	DEFAULT_MQTT_PORT,
+	DEFAULT_TEMP_RATE,
+	DEFAULT_STATUS_RATE,
+	DEFAULT_RELAY_PULSE
+};
 
 struct temperature_t {
 	char	address[24];	// "XX:XX:XX:XX:XX:XX:XX:XX" + '\0'
@@ -238,12 +241,21 @@ struct temperature_t {
 // === Upload/Update
 static volatile bool shouldReboot = false;
 
+// === Display
+void D(String m);
+
 static void handleUploadPage();
 static void handleUploadPost();
 static void handleUploadStream();
 
 // === UI
 static void uiPage();
+DynamicJsonDocument getStatusAsJSON();
+
+// === MQTT publish helpers
+bool blinkLED(void* opaque);
+bool publishHumidity(void* opaque);
+bool publishPlayStatus(void* opaque, int item, String status);
 
 // === WiFi Manager
 static 					WiFiManager wm;
@@ -311,10 +323,9 @@ static void normalizeAppConfigDefaults() {
 	if(appConfig.relayPulseDuration == 0) appConfig.relayPulseDuration = DEFAULT_RELAY_PULSE;
 }
 
-struct Screen {
-	String		lines[DISPLAY_LINES];
-};
-Screen screen;
+static void makeDeviceTopic(char* out, size_t outSize, const char* device) {
+	snprintf(out, outSize, "spencer/%s/%s", systemID, device);
+}
 
 bool lastStatus0 = false, lastStatus1 = false;
 bool reset_is_down = false;
@@ -503,17 +514,16 @@ bool loadConfiguration(const char *filename, AppConfig &config) {
 			file.close();
 			return false;
 		} else {
-			strlcpy(config.MQTTBroker, doc["MQTTBroker"], sizeof(config.MQTTBroker));
+			const char* broker = doc["MQTTBroker"] | "";
+			strlcpy(config.MQTTBroker, broker, sizeof(config.MQTTBroker));
 
-			config.MQTTPort = doc["MQTTPort"];
+			config.MQTTPort = doc["MQTTPort"] | DEFAULT_MQTT_PORT;
 
-			config.temperatureUpdateRate = doc["temperatureUpdateRate"];
-//			if(config.temperatureUpdateRate == NULL) config.temperatureUpdateRate = 1;
+			config.temperatureUpdateRate = doc["temperatureUpdateRate"] | DEFAULT_TEMP_RATE;
 
-			config.statusUpdateRate = doc["statusUpdateRate"];
-//			if(config.statusUpdateRate == NULL) config.statusUpdateRate = 1;
+			config.statusUpdateRate = doc["statusUpdateRate"] | DEFAULT_STATUS_RATE;
 
-			config.relayPulseDuration = doc["relayPulseDuration"];
+			config.relayPulseDuration = doc["relayPulseDuration"] | DEFAULT_RELAY_PULSE;
 			if(config.relayPulseDuration < 100) config.relayPulseDuration = 100;
 			if(config.relayPulseDuration > 60000) config.relayPulseDuration = 60000;
 		} 
@@ -589,6 +599,7 @@ static bool wifiBegin(bool forcePortal) {
 		wm.addParameter(&pMqttPort);
 		wm.addParameter(&pTempRate);
 		wm.addParameter(&pStatusRate);
+		wm.addParameter(&pRelayDuration);
 		wmParamsAdded = true;
 	}	
 
@@ -945,7 +956,7 @@ temperature_t updateTemperature(uint8_t index) {
 	if (!isnan(r.tempF))
 		r.valid = true;
 	else
-		r.tempF = 0.0f
+		r.tempF = 0.0f;
 #else
 	(void)index; // unused
 
@@ -988,10 +999,7 @@ bool publishTemperature(void* opaque) {
 	blinkLED(nullptr);
 
 	// Base topic: "spencer/<systemID>/temperature"
-	memset(baseTopic, 0, sizeof(baseTopic));
-	strncpy(baseTopic, "spencer/", sizeof(baseTopic) - 1);
-	strncat(baseTopic, systemID, sizeof(baseTopic) - strlen(baseTopic) - 1);
-	strncat(baseTopic, "/temperature", sizeof(baseTopic) - strlen(baseTopic) - 1);
+	makeDeviceTopic(baseTopic, sizeof(baseTopic), "temperature");
 
 	// Single-sensor topic is exactly baseTopic
     const char* legacyTopic = baseTopic;
@@ -1099,10 +1107,7 @@ bool publishHumidity(void* opaque) {
 	String temp = updateHumidity();
 	D(String(F("Humd 0: ")) + temp);
 
-	memset(buf, 0, sizeof(buf));
-	strncpy(buf, "spencer/", sizeof(buf));
-	strcat(buf, systemID);
-	strcat(buf, "/humidity");
+	makeDeviceTopic(buf, sizeof(buf), "humidity");
 	
 	blinkLED((void *)0);
 	
@@ -1139,10 +1144,7 @@ bool publishStatus(void* opaque) {
 
 	D(String(F("Status: ")) + String(input0) + String(F(" ")) + String(input1));
 
-	memset(buf, 0, sizeof(buf));
-	strncpy(buf, "spencer/", sizeof(buf));
-	strcat(buf, systemID);
-	strcat(buf, "/status");
+	makeDeviceTopic(buf, sizeof(buf), "status");
 	
 	blinkLED((void *)0);
 	
@@ -1166,10 +1168,7 @@ bool publishReboot(void* opaque) {
 	bool	input0 = false;
 	bool	input1 = false;
 
-	memset(buf, 0, sizeof(buf));
-	strncpy(buf, "spencer/", sizeof(buf));
-	strcat(buf, systemID);
-	strcat(buf, "/reboot");
+	makeDeviceTopic(buf, sizeof(buf), "reboot");
 	
 	blinkLED((void *)0);
 	
@@ -1214,10 +1213,7 @@ bool publishRelays(void* opaque) {
 #endif
 	D(String(F("Relays: ")) + String(relay0) + String(F(" ")) + String(relay1));
 
-	memset(buf, 0, sizeof(buf));
-	strncpy(buf, "spencer/", sizeof(buf));
-	strcat(buf, systemID);
-	strcat(buf, "/relay");
+	makeDeviceTopic(buf, sizeof(buf), "relay");
 	
 	blinkLED((void *)0);
 	
@@ -1245,10 +1241,7 @@ bool publishPlayStatus(void* opaque, int item, String status) {
 	char	data[200];
 	char	buf[64];
 
-	memset(buf, 0, sizeof(buf));
-	strncpy(buf, "spencer/", sizeof(buf));
-	strcat(buf, systemID);
-	strcat(buf, "/trigger");
+	makeDeviceTopic(buf, sizeof(buf), "trigger");
 	
 	blinkLED((void *)0);
 	
@@ -1579,9 +1572,7 @@ DynamicJsonDocument getStatusAsJSON() {
 #else
 			strcpy(idStripped, "0");
 #endif
-			memset(key, 0, sizeof(key));
-			strncpy(key, "temperature-", sizeof(key) - 1);
-			strncat(key, idStripped, sizeof(key) - strlen(key) - 1);
+			snprintf(key, sizeof(key), "temperature-%s", idStripped);
 
 			snprintf(tempStr, sizeof(tempStr), "%.1f", t.tempF);
 			doc[key] = tempStr;
@@ -1778,48 +1769,13 @@ void rootPage() {
 }
 
 
-bool clearMessage(void* opaque) 
-{
-	D("");
-			
-	return true;
-}
-
-void clearDisplay() 
-{
-	display.clearDisplay();
-	display.setCursor(0,0);
-	display.display();
-	
-	for(int i = 0; i < DISPLAY_LINES; i++)
-		screen.lines[i] = String();
-}
-
 void D(String m)
 {
-	for(int i = 0; i < DISPLAY_LINES-1; i++) {
-		screen.lines[i] = screen.lines[i + 1];
-	}
-	screen.lines[DISPLAY_LINES-1] = m;
-	
 #ifdef DEBUG_D
 	Serial.println("D: " + m);
 #endif
 
-	display.clearDisplay();
-	display.setCursor(0,0);
-	
-	for(int i = 0; i < DISPLAY_LINES; i++) {
-		display.println(screen.lines[i]);
-//		Serial.println("D[" + String(i) + "]: " + screen.lines[i]);
-	}
-
-	if(m.length() != 0) {
-		timer.cancel(scrollTimer);
-		scrollTimer = timer.every(DISPLAY_TIMEOUT, clearMessage, (void *)0);
-	}
-
-	display.display();
+	mdsDisplay.D(m);
 }
 
 static void setupSystem() {
@@ -1842,27 +1798,11 @@ void setupDisplay()
 #if IS_ESP32
 	Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
 #endif
-	if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { // Address 0x3C for 128x32
-		Serial.println(F("SSD1306 allocation failed"));
-		for(;;); // Don't proceed, loop forever
-	}
-
 #ifdef ROTATE_DISPLAY
-	display.setRotation(2);
+	mdsDisplay.setup(true);
+#else
+	mdsDisplay.setup(false);
 #endif
-	clearDisplay();
-
-	display.setTextSize(1);
-	display.setTextColor(SSD1306_WHITE);
-	display.setTextWrap(false);
-	display.setCursor(0,0);
-
-	display.display();
-
-	for(int i = 0; i < DISPLAY_LINES; i++)
-		screen.lines[i] = String();
-
-	scrollTimer = timer.every(DISPLAY_TIMEOUT, clearMessage, (void *)0);
 }
 
 
@@ -1900,9 +1840,10 @@ void setupDFP() {
 
 
 void welcome() {
-	display.clearDisplay();
+	Adafruit_SSD1306* display = mdsDisplay.getDevice();
 
-	display.setCursor(0,0);
+	display->clearDisplay();
+	display->setCursor(0,0);
 
 	for(int i = 0; i < 3; i++) {
 		digitalWrite(PIN_LED, 0);
@@ -1917,20 +1858,20 @@ void welcome() {
 	Serial.print(getBuildDate());
 	Serial.println(F("). Copyright (C) 2026, Marc D. Spencer")); 
 
-	display.print(F("MQTT Agent, V"));
-	display.println(VERSION); 
-	display.println(); 
-	display.println(F("(C) 2026"));
-	display.println(F("Marc D. Spencer")); 
+	display->print(F("MQTT Agent, V"));
+	display->println(VERSION);
+	display->println();
+	display->println(F("(C) 2026"));
+	display->println(F("Marc D. Spencer"));
 
-	display.display();
+	display->display();
 
 	digitalWrite(PIN_LED, 0);
 	delay(5000);
 	digitalWrite(PIN_LED, 1);
 
-	display.clearDisplay();
-	display.display();
+	display->clearDisplay();
+	display->display();
 }
 
 
@@ -1967,9 +1908,7 @@ void mqttConnect() {
 	client.setCallback(callback);
 	client.setBufferSize(512);
 
-	memset(buf, 0, sizeof(buf));
-	strncpy(buf, "MQTT-Agent-", sizeof(buf)-1);
-	strncat(buf, systemID, sizeof(buf)-1);
+	snprintf(buf, sizeof(buf), "MQTT-Agent-%s", systemID);
 
 	if(client.connect(buf)) {
 		D(F("MQTT: Connected."));
@@ -1982,10 +1921,7 @@ void mqttConnect() {
 			
 		happyBlinkTimer = timer.every(HAPPY_PERIOD, blinkLED, (void *)0);
 
-		memset(buf, 0, sizeof(buf));
-		strncpy(buf, "spencer/", sizeof(buf)-1);
-		strncat(buf, systemID, sizeof(buf)-1);
-		strncat(buf, "/notice", sizeof(buf)-1);
+		makeDeviceTopic(buf, sizeof(buf), "notice");
 		
 		StaticJsonDocument<200> doc;
 		doc["id"] = systemID;
@@ -2303,6 +2239,8 @@ void loop() {
 	if (rebootPressedTime > 0 && (long)(millis() - rebootPressedTime) >= 0) {
 		reboot();
 	}
+
+	mdsDisplay.tick();
 	
 	if (wifiProvisioning) {
 		if (wifiReady()) {

@@ -6,24 +6,19 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <arduino-timer.h>
 
-
-#define	DISPLAY_LINES		4		// Number of text lines that fit on the display
-#define SCREEN_WIDTH		128		// OLED display width, in pixels
-#define SCREEN_HEIGHT		32		// OLED display height, in pixels
-#define OLED_RESET    		-1		// Reset pin # (or -1 if sharing Arduino reset pin)
-#define	DISPLAY_TIMEOUT		5000	// Time(ms) between each display scroll
-
-struct Screen {
-	String		lines[DISPLAY_LINES];
-};
+#define MDS_DISPLAY_MAX_LINES	8
 
 class MDS_Display {
 	public:
-        MDS_Display();
+        MDS_Display(uint16_t width,
+                    uint16_t height,
+                    int8_t resetPin,
+                    TwoWire* wire,
+                    uint8_t lineCount,
+                    unsigned long displayTimeout);
         ~MDS_Display();
-        void				setup();
+        void				setup(bool rotate);
         bool				clearMessage();
         void				clear();
         void				D(String m);
@@ -33,7 +28,9 @@ class MDS_Display {
 	private:
 		Adafruit_SSD1306	display;
 		bool				isSetup = false;
-		Screen				screen;
+		String				lines[MDS_DISPLAY_MAX_LINES];
+		uint8_t				lineCount;
+		unsigned long		displayTimeout;
 		unsigned long		nextClearTime;
 };
 

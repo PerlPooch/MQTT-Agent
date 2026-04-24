@@ -2,15 +2,22 @@
 #include <Adafruit_SSD1306.h>
 
 
-MDS_Display::MDS_Display()
-: display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET)
+MDS_Display::MDS_Display(uint16_t width,
+                         uint16_t height,
+                         int8_t resetPin,
+                         TwoWire* wire,
+                         uint8_t lineCount,
+                         unsigned long displayTimeout)
+: display(width, height, wire, resetPin),
+  lineCount(lineCount == 0 ? 1 : (lineCount > MDS_DISPLAY_MAX_LINES ? MDS_DISPLAY_MAX_LINES : lineCount)),
+  displayTimeout(displayTimeout)
 {
 }
 
 MDS_Display::~MDS_Display() {
 }
 
-void MDS_Display::setup() {
+void MDS_Display::setup(bool rotate) {
 	Serial.println(F("MDS_Display::setup"));
 
 	if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { // Address 0x3C for 128x32
@@ -18,7 +25,10 @@ void MDS_Display::setup() {
 		for(;;); // Don't proceed, loop forever
 	}
 
-	display.setRotation(2);
+	if(rotate) {
+		display.setRotation(2);
+	}
+
 	clear();
 
 	display.setTextSize(1);
@@ -28,10 +38,11 @@ void MDS_Display::setup() {
 
 	display.display();
 
-	for(int i = 0; i < DISPLAY_LINES; i++)
-		screen.lines[i] = String();
+	for(int i = 0; i < lineCount; i++)
+		lines[i] = String();
 
-	nextClearTime = millis() + DISPLAY_TIMEOUT;
+	nextClearTime = millis() + displayTimeout;
+	isSetup = true;
 }
 
 bool MDS_Display::clearMessage() {
@@ -45,26 +56,28 @@ void MDS_Display::clear() {
  	display.setCursor(0,0);
  	display.display();
 	
-	for(int i = 0; i < DISPLAY_LINES; i++)
-		screen.lines[i] = String();
+	for(int i = 0; i < lineCount; i++)
+		lines[i] = String();
 }
 
 void MDS_Display::D(String m) {
-	for(int i = 0; i < DISPLAY_LINES-1; i++) {
-		screen.lines[i] = screen.lines[i + 1];
+	if(!isSetup) return;
+
+	for(int i = 0; i < lineCount-1; i++) {
+		lines[i] = lines[i + 1];
 	}
 
-	screen.lines[DISPLAY_LINES-1] = m;
+	lines[lineCount-1] = m;
 	
 	display.clearDisplay();
 	display.setCursor(0,0);
 	
-	for(int i = 0; i < DISPLAY_LINES; i++) {
-		display.println(screen.lines[i]);
+	for(int i = 0; i < lineCount; i++) {
+		display.println(lines[i]);
 	}
 
 	if(m.length() != 0) {
-		nextClearTime = millis() + DISPLAY_TIMEOUT;
+		nextClearTime = millis() + displayTimeout;
 	}
 
 	display.display();
@@ -75,9 +88,11 @@ Adafruit_SSD1306* MDS_Display::getDevice() {
 }
 
 void MDS_Display::tick() {
+	if(!isSetup) return;
+
 	if(millis() >= nextClearTime) {
 		clearMessage();
 	
-		nextClearTime = millis() + DISPLAY_TIMEOUT;
+		nextClearTime = millis() + displayTimeout;
 	}
 }
