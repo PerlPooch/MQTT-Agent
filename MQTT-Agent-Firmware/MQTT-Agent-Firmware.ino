@@ -1,5 +1,6 @@
 #include "MDS_Platform.h"
 #include "MDS_Display.h"
+#include "MDS_Config.h"
 #include "uiHtml.h"
 
 // ---- Configuration -------------------------------------------------------------------
@@ -59,7 +60,7 @@
 #endif
 
 
-#define VERSION				"2.3"
+#define VERSION				"2.4"
 #define ACCESSPOINT_NAME	"MQA"
 
 #define SCREEN_WIDTH		128		// OLED display width, in pixels
@@ -224,13 +225,17 @@ struct AppConfig {
 	uint16_t	statusUpdateRate;
 	uint16_t	relayPulseDuration;
 };
-AppConfig appConfig = {
-	"",
-	DEFAULT_MQTT_PORT,
-	DEFAULT_TEMP_RATE,
-	DEFAULT_STATUS_RATE,
-	DEFAULT_RELAY_PULSE
+AppConfig appConfig;
+
+static const MDS_ConfigField appConfigFields[] = {
+	MDS_CONFIG_FIELD_STRING(AppConfig, MQTTBroker, "MQTTBroker", ""),
+	MDS_CONFIG_FIELD_UINT16(AppConfig, MQTTPort, "MQTTPort", DEFAULT_MQTT_PORT, 1, 65535),
+	MDS_CONFIG_FIELD_UINT16(AppConfig, temperatureUpdateRate, "temperatureUpdateRate", DEFAULT_TEMP_RATE, 0, 65535),
+	MDS_CONFIG_FIELD_UINT16(AppConfig, statusUpdateRate, "statusUpdateRate", DEFAULT_STATUS_RATE, 0, 65535),
+	MDS_CONFIG_FIELD_UINT16(AppConfig, relayPulseDuration, "relayPulseDuration", DEFAULT_RELAY_PULSE, 100, 60000)
 };
+
+MDS_Config<AppConfig> appConfigStore(CONFIG_FILE, appConfigFields);
 
 struct temperature_t {
 	char	address[24];	// "XX:XX:XX:XX:XX:XX:XX:XX" + '\0'
@@ -271,40 +276,11 @@ static char wmTempRate[6];
 static char wmStatusRate[6];
 static char wmRelayPulse[6];
 
-static WiFiManagerParameter pMqttBroker(
-	"mqttBroker",
-	"MQTT Broker",
-	appConfig.MQTTBroker,
-	sizeof(appConfig.MQTTBroker)
-);
-
-static WiFiManagerParameter pMqttPort(
-	"mqttPort",
-	"MQTT Port",
-	wmMqttPort,
-	sizeof(wmMqttPort)
-);
-
-static WiFiManagerParameter pTempRate(
-	"tempRate",
-	"Temperature Update Rate (s)",
-	wmTempRate,
-	sizeof(wmTempRate)
-);
-
-static WiFiManagerParameter pStatusRate(
-	"statusRate",
-	"Status Update Rate (s)",
-	wmStatusRate,
-	sizeof(wmStatusRate)
-);
-
-static WiFiManagerParameter pRelayDuration(
-	"relayDuration",
-	"Relay Pulse (ms)",
-	wmRelayPulse,
-	sizeof(wmRelayPulse)
-);
+static WiFiManagerParameter pMqttBroker("mqttBroker", "MQTT Broker", appConfig.MQTTBroker, sizeof(appConfig.MQTTBroker));
+static WiFiManagerParameter pMqttPort("mqttPort", "MQTT Port", wmMqttPort, sizeof(wmMqttPort));
+static WiFiManagerParameter pTempRate("tempRate", "Temperature Update Rate (s)", wmTempRate, sizeof(wmTempRate));
+static WiFiManagerParameter pStatusRate("statusRate", "Status Update Rate (s)", wmStatusRate, sizeof(wmStatusRate));
+static WiFiManagerParameter pRelayDuration("relayDuration", "Relay Pulse (ms)", wmRelayPulse, sizeof(wmRelayPulse));
 
 static uint16_t parseU16(const char* s, uint16_t def) {
 	if(!s || !*s) return def;
@@ -314,13 +290,6 @@ static uint16_t parseU16(const char* s, uint16_t def) {
 	if(end == s) return def;
 	if(v > 65535UL) return def;
 	return (uint16_t)v;
-}
-
-static void normalizeAppConfigDefaults() {
-	if(appConfig.MQTTPort == 0) appConfig.MQTTPort = DEFAULT_MQTT_PORT;
-	if(appConfig.temperatureUpdateRate == 0) appConfig.temperatureUpdateRate = DEFAULT_TEMP_RATE;
-	if(appConfig.statusUpdateRate == 0) appConfig.statusUpdateRate = DEFAULT_STATUS_RATE;
-	if(appConfig.relayPulseDuration == 0) appConfig.relayPulseDuration = DEFAULT_RELAY_PULSE;
 }
 
 static void makeDeviceTopic(char* out, size_t outSize, const char* device) {
@@ -455,21 +424,6 @@ void dfpPrintDetail(uint8_t type, int value) {
 }
 #endif
 
-void printFile(const char *filename) {
-	File file = LittleFS.open(filename, "r");
-	if (!file) {
-		Serial.println(F("Unable to read file"));
-		return;
-	}
-
-	while (file.available()) {
-		Serial.print((char)file.read());
-	}
-	Serial.println();
-
-	file.close();
-}
-
 void listDir(fs::FS &fs, const char *dirname){
 	Serial.printf("  Directory %s:\n", dirname);
 
@@ -501,66 +455,22 @@ void listDir(fs::FS &fs, const char *dirname){
 #endif
 }
 
-bool loadConfiguration(const char *filename, AppConfig &config) {
-	File file = LittleFS.open(filename, "r");
-
-	if (file) {
-		StaticJsonDocument<512> doc;
-
-		DeserializationError error = deserializeJson(doc, file);
-
-		if (error) {
-			Serial.println(F("Unable to read configuration"));
-			file.close();
-			return false;
-		} else {
-			const char* broker = doc["MQTTBroker"] | "";
-			strlcpy(config.MQTTBroker, broker, sizeof(config.MQTTBroker));
-
-			config.MQTTPort = doc["MQTTPort"] | DEFAULT_MQTT_PORT;
-
-			config.temperatureUpdateRate = doc["temperatureUpdateRate"] | DEFAULT_TEMP_RATE;
-
-			config.statusUpdateRate = doc["statusUpdateRate"] | DEFAULT_STATUS_RATE;
-
-			config.relayPulseDuration = doc["relayPulseDuration"] | DEFAULT_RELAY_PULSE;
-			if(config.relayPulseDuration < 100) config.relayPulseDuration = 100;
-			if(config.relayPulseDuration > 60000) config.relayPulseDuration = 60000;
-		} 
-
-		file.close();
-		return true;
-	} else {
-		Serial.println(F("Unable to open configuration."));
-		return false;
+static bool saveAppConfig() {
+	appConfigStore.data() = appConfig;
+	bool ok = appConfigStore.save();
+	// Save normalizes through the schema, so mirror any clamped values back to runtime state.
+	appConfig = appConfigStore.data();
+	if(!ok) {
+		Serial.print(F("Config: Save failed: "));
+		Serial.println(appConfigStore.lastErrorText());
 	}
+	return ok;
 }
 
-
-void saveConfiguration(const char *filename, const AppConfig &config) {
-	LittleFS.remove(filename);
-
-	File file = LittleFS.open(filename, "w");
-	if (!file) {
-		Serial.println(F("Unable to create configuration file"));
-		return;
-	}
-
-	StaticJsonDocument<512> doc;
-
-	doc["MQTTBroker"] = config.MQTTBroker;
-	doc["MQTTPort"] = config.MQTTPort;
-	doc["temperatureUpdateRate"] = config.temperatureUpdateRate;
-	doc["statusUpdateRate"] = config.statusUpdateRate;
-	doc["relayPulseDuration"] = config.relayPulseDuration;
-
-	serializeJsonPretty(doc, Serial);
-
-	if (serializeJson(doc, file) == 0) {
-		Serial.println(F("Unable to write configuration file"));
-	}
-
-	file.close();
+static bool loadAppConfig() {
+	bool ok = appConfigStore.load();
+	appConfig = appConfigStore.data();
+	return ok;
 }
 
 void configModeCallback(WiFiManager *myWM) {
@@ -575,8 +485,6 @@ void configModeCallback(WiFiManager *myWM) {
 
 static bool wifiBegin(bool forcePortal) {
 	wmShouldSave = false;
-
-	normalizeAppConfigDefaults();
 
 	uint16_t portForUi		= appConfig.MQTTPort;
 	uint16_t tempForUi		= appConfig.temperatureUpdateRate;
@@ -655,21 +563,19 @@ button,input[type=submit]{border-radius:var(--radius);cursor:pointer;background-
 		        sizeof(appConfig.MQTTBroker));
 
 		appConfig.MQTTPort =
-			parseU16(pMqttPort.getValue(), DEFAULT_MQTT_PORT);
+			parseU16(pMqttPort.getValue(), appConfig.MQTTPort);
 
 		appConfig.temperatureUpdateRate =
-			parseU16(pTempRate.getValue(), DEFAULT_TEMP_RATE);
+			parseU16(pTempRate.getValue(), appConfig.temperatureUpdateRate);
 
 		appConfig.statusUpdateRate =
-			parseU16(pStatusRate.getValue(), DEFAULT_STATUS_RATE);
+			parseU16(pStatusRate.getValue(), appConfig.statusUpdateRate);
 
 		// parseU16 limits the upper bound to 65535
 		appConfig.relayPulseDuration =
-			parseU16(pRelayDuration.getValue(), DEFAULT_RELAY_PULSE);
-		if(appConfig.relayPulseDuration < 100) appConfig.relayPulseDuration = 100;
-		if(appConfig.relayPulseDuration > 60000) appConfig.relayPulseDuration = 60000;
+			parseU16(pRelayDuration.getValue(), appConfig.relayPulseDuration);
 
-		saveConfiguration(CONFIG_FILE, appConfig);
+		saveAppConfig();
 	}
 
 	return true;
@@ -1364,24 +1270,22 @@ void callback(char* in_topic, byte* in_message, unsigned int length) {
  	
 	 	if(device == "temperature") {
  			appConfig.temperatureUpdateRate = rate.toInt();
+			saveAppConfig();
  			D("Set-rate Temp: " + String(appConfig.temperatureUpdateRate));
- 			saveConfiguration(CONFIG_FILE, appConfig);
  			timer.cancel(temperatureTimer);
  			if(appConfig.temperatureUpdateRate > 0)
  				temperatureTimer = timer.every(appConfig.temperatureUpdateRate * 1000, publishTemperature, (void *)0);
 		} else if(device == "status") {
  			appConfig.statusUpdateRate = rate.toInt();
+			saveAppConfig();
  			D("Set-rate Status: " + String(appConfig.statusUpdateRate));
- 			saveConfiguration(CONFIG_FILE, appConfig);
  			timer.cancel(statusTimer);
  			if(appConfig.statusUpdateRate > 0)
  				statusTimer = timer.every(appConfig.statusUpdateRate * 1000, publishStatus, (void *)0);
 		} else if(device == "relay") {
  			appConfig.relayPulseDuration = rate.toInt();
-			if(appConfig.relayPulseDuration < 100) appConfig.relayPulseDuration = 100;
-			if(appConfig.relayPulseDuration > 60000) appConfig.relayPulseDuration = 60000;
+			saveAppConfig();
  			D("Set-rate RDur: " + String(appConfig.relayPulseDuration));
- 			saveConfiguration(CONFIG_FILE, appConfig);
 		}
  	} else if(command == "set") {
 		jsonValue = doc["device-num"] | "";
@@ -1654,8 +1558,8 @@ void rootPage() {
 
 	if(Server.hasArg(F("statusUpdateRate"))) {
 		appConfig.statusUpdateRate = Server.arg(F("statusUpdateRate")).toInt();
+		saveAppConfig();
 		D("Set-rate Status: " + String(appConfig.statusUpdateRate));
-		saveConfiguration(CONFIG_FILE, appConfig);
 		timer.cancel(statusTimer);
 		if(appConfig.statusUpdateRate > 0)
 			statusTimer = timer.every(appConfig.statusUpdateRate * 1000, publishStatus, (void *)0);
@@ -1663,18 +1567,16 @@ void rootPage() {
 
 #if defined(USE_RELAY_0) || defined(USE_RELAY_1)
 	if(Server.hasArg(F("relayPulseDuration"))) {
-		long pulse = Server.arg(F("relayPulseDuration")).toInt();
-		pulse = constrain(pulse, 100L, 60000L);
-		appConfig.relayPulseDuration = (uint16_t)pulse;
+		appConfig.relayPulseDuration = Server.arg(F("relayPulseDuration")).toInt();
+		saveAppConfig();
 		D("Set-rate RDur: " + String(appConfig.relayPulseDuration));
-		saveConfiguration(CONFIG_FILE, appConfig);
 	}
 #endif
 
 	if(Server.hasArg(F("temperatureUpdateRate"))) {
 		appConfig.temperatureUpdateRate = Server.arg(F("temperatureUpdateRate")).toInt();
+		saveAppConfig();
 		D("Set-rate Temp: " + String(appConfig.temperatureUpdateRate));
-		saveConfiguration(CONFIG_FILE, appConfig);
 		timer.cancel(temperatureTimer);
 		if(appConfig.temperatureUpdateRate > 0)
 			temperatureTimer = timer.every(appConfig.temperatureUpdateRate * 1000, publishTemperature, (void *)0);
@@ -1707,14 +1609,14 @@ void rootPage() {
 
 			D(String(F("Set-broker: ")) + host + F(":") + String(appConfig.MQTTPort));
 
-			saveConfiguration(CONFIG_FILE, appConfig);
+			saveAppConfig();
 		} else {
 			memset(appConfig.MQTTBroker, 0, sizeof(appConfig.MQTTBroker));
 			appConfig.MQTTPort = port;
 
 			D(String(F("Set-broker: none")));;
 
-			saveConfiguration(CONFIG_FILE, appConfig);
+			saveAppConfig();
 			
 			shouldReboot = true;
 		}
@@ -2108,16 +2010,9 @@ owInventory();
 
 // ----------- LittleFS -----------------------------------------------------------
 
-	bool restored = false;
 	bool fsOk = false;
 
-#if IS_ESP32
-	// ESP32: allow format-on-fail to recover cleanly
-	fsOk = LittleFS.begin(true);
-#else
-	// ESP8266: begin() only; format is a separate call if you want it
-	fsOk = LittleFS.begin();
-#endif
+	fsOk = appConfigStore.setup();
 
 	if(!fsOk) {
 		Serial.println(F("LittleFS: Mount Failed"));
@@ -2128,16 +2023,23 @@ owInventory();
 	}
 
 	// Should load default config if run for the first time
-	Serial.print(F("Loading configuration ... "));
-	if(! loadConfiguration(CONFIG_FILE, appConfig)) {
-		Serial.print(F("Saving default configuration ... "));
-	 	saveConfiguration(CONFIG_FILE, appConfig);
+	Serial.print(F("Config: Loading configuration ... "));
+	if(!loadAppConfig()) {
+		Serial.print(F("Config: Load failed: "));
+		Serial.println(appConfigStore.lastErrorText());
+		Serial.print(F("Config: Saving default configuration ... "));
+		if(!appConfigStore.save()) {
+			Serial.print(F("Config: Save failed: "));
+			Serial.println(appConfigStore.lastErrorText());
+		}
+		appConfig = appConfigStore.data();
 	}
 	Serial.println(F("Done."));
 
 	// Dump config file
- 	Serial.println(F("Print config file..."));
- 	printFile(CONFIG_FILE);
+	Serial.println(F("Config: Print config file..."));
+	appConfigStore.print(Serial);
+	Serial.println();
 
 // ----------- WiFi -----------------------------------------------------------
 
