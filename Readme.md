@@ -1,5 +1,7 @@
 # Spencer MQTT Agent
 
+Please see the [Project Website](https://home.marcspencer.com/mqtt-agent/) for detailed information, full API, and build details. 
+
 ## MQTT Topic
 
 	spencer/<ID>/<device>
