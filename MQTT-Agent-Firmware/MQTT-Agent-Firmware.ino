@@ -1,5 +1,7 @@
 #include "MDS_Platform.h"
 #include "AgentConfig.h"
+#include <MDS_Display.h>
+#include <MDS_HTTP.h>
 
 // ---- Configuration -------------------------------------------------------------------
 //
@@ -23,10 +25,8 @@
 
 #if IS_ESP8266
 	#include <ESP8266WiFi.h>
-	#include <ESP8266WebServer.h>
 #elif IS_ESP32
 	#include <WiFi.h>
-	#include <WebServer.h>
 	#include <esp_mac.h>
 #endif
 #include <WiFiManager.h>
@@ -38,10 +38,7 @@
 #include <DallasTemperature.h>
 #endif
 #include <arduino-timer.h>
-#include <SPI.h>
 #include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
 #ifdef USE_DHT11_TEMPERATURE
 #include "DHT.h"
 #endif
@@ -62,9 +59,6 @@
 #define VERSION				"2.2"
 #define ACCESSPOINT_NAME	"MQA"
 
-#define SCREEN_WIDTH		128		// OLED display width, in pixels
-#define SCREEN_HEIGHT		32		// OLED display height, in pixels
-#define OLED_RESET    		-1		// Reset pin # (or -1 if sharing Arduino reset pin)
 // #define DEBUG_D						// Mirror screen to serial
 
 #if IS_ESP8266
@@ -134,8 +128,6 @@
 
 #define DHT_TYPE				DHT11
 
-#define	DISPLAY_TIMEOUT			5000	// Time(ms) between each display scroll
-#define	DISPLAY_LINES			4		// Number of text lines that fit on the display
 #define	RELAY_TIMEOUT			500 	// Time(ms) for relay pulses
 #define	HAPPY_PERIOD			5000	// Time(ms) for happy LED blinks
 #define	HAPPY_NOMQTT_PERIOD		10000	// Time(ms) for happy LED blinks
@@ -157,11 +149,7 @@
 
 char				systemID[32];		// System ID. Based on the WiFi MAC
 
-#if IS_ESP8266
-ESP8266WebServer 	Server;
-#elif IS_ESP32
-WebServer 			Server;
-#endif
+MDS_HTTP http;
 
 #ifdef USE_1WIRE_TEMPERATURE
 OneWire 			oneWire(PIN_TEMP_0);
@@ -191,10 +179,15 @@ MIDI_CREATE_INSTANCE(SoftwareSerial, mySerial, midiA);
 WiFiClient 			wifiClient;
 PubSubClient 		client(wifiClient);
 
-Adafruit_SSD1306	display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+#ifdef ROTATE_DISPLAY
+constexpr uint8_t DisplayRotation = 2;
+#else
+constexpr uint8_t DisplayRotation = 0;
+#endif
+
+MDS_Display display(Wire, 0x3C, DisplayRotation);
 
 Timer<>::Task		happyBlinkTimer;
-Timer<>::Task		scrollTimer;
 Timer<>::Task		temperatureTimer;
 Timer<>::Task		statusTimer;
 #ifdef USE_DFPLAYER
@@ -292,11 +285,6 @@ static bool setConfigNumber(const char* key, const String& text) {
 		return configError();
 	return true;
 }
-
-struct Screen {
-	String		lines[DISPLAY_LINES];
-};
-Screen screen;
 
 bool lastStatus0 = false, lastStatus1 = false;
 bool reset_is_down = false;
@@ -573,6 +561,7 @@ static void wifiRetryTick() {
 	wifiNextRetry = now + WIFI_RETRY_PERIOD;
 }
 
+// Serve the existing browser form for uploading a firmware binary.
 static void handleUploadPage()
 {
 	if(!wifiEverUp) return;
@@ -605,7 +594,7 @@ static void handleUploadPage()
 		"</div>"
 		"</body></html>";
 
-	Server.send(200, "text/html", uploadHtml);
+	http.server().send(200, "text/html", uploadHtml);
 }
 
 static void handleUploadPost()
@@ -613,17 +602,18 @@ static void handleUploadPost()
 	// Called after upload completes (success or failure)
 	if (Update.hasError()) {
 		String msg = "Update failed.\n";
-		Server.send(500, "text/plain", msg);
+		http.server().send(500, "text/plain", msg);
 		return;
 	}
 
-	Server.send(200, "text/plain", "Update OK. Rebooting...\n");
+	http.server().send(200, "text/plain", "Update OK. Rebooting...\n");
 	shouldReboot = true; // reboot in loop after response is sent
 }
 
+// Write incoming firmware chunks and finalize or abort the update.
 static void handleUploadStream()
 {
-	HTTPUpload &upload = Server.upload();
+	HTTPUpload &upload = http.server().upload();
 
 	if (upload.status == UPLOAD_FILE_START) {
 		Serial.printf("OTA: Start: %s\n", upload.filename.c_str());
@@ -1433,6 +1423,7 @@ DynamicJsonDocument getStatusAsJSON() {
 }
 
 
+// Apply query-string controls and return the current agent status as JSON.
 void rootPage() {
 	if(!wifiEverUp) return;
 	
@@ -1440,9 +1431,9 @@ void rootPage() {
 
 	memset(data, 0, sizeof(data));
 
-	if(Server.hasArg(F("statusUpdateRate"))) {
-		if (!setConfigNumber("statusUpdateRate", Server.arg(F("statusUpdateRate")))) {
-			Server.send(400, "text/plain", configuration.lastError());
+	if(http.server().hasArg(F("statusUpdateRate"))) {
+		if (!setConfigNumber("statusUpdateRate", http.server().arg(F("statusUpdateRate")))) {
+			http.server().send(400, "text/plain", configuration.lastError());
 			return;
 		}
 		D("Set-rate Status: " + String(appConfig.statusUpdateRate));
@@ -1451,9 +1442,9 @@ void rootPage() {
 			statusTimer = timer.every(appConfig.statusUpdateRate * 1000UL, publishStatus, (void *)0);
 	}
 
-	if(Server.hasArg(F("temperatureUpdateRate"))) {
-		if (!setConfigNumber("temperatureUpdateRate", Server.arg(F("temperatureUpdateRate")))) {
-			Server.send(400, "text/plain", configuration.lastError());
+	if(http.server().hasArg(F("temperatureUpdateRate"))) {
+		if (!setConfigNumber("temperatureUpdateRate", http.server().arg(F("temperatureUpdateRate")))) {
+			http.server().send(400, "text/plain", configuration.lastError());
 			return;
 		}
 		D("Set-rate Temp: " + String(appConfig.temperatureUpdateRate));
@@ -1462,8 +1453,8 @@ void rootPage() {
 			temperatureTimer = timer.every(appConfig.temperatureUpdateRate * 1000UL, publishTemperature, (void *)0);
 	}	
 	
-	if(Server.hasArg(F("broker"))) {
-		String host = Server.arg(F("broker")); // Existing "host:port" or "host" interface.
+	if(http.server().hasArg(F("broker"))) {
+		String host = http.server().arg(F("broker")); // Existing "host:port" or "host" interface.
 		host.trim();
 		JsonDocument updates;
 		updates["MQTTPort"] = 1883;
@@ -1473,7 +1464,7 @@ void rootPage() {
 			port.trim();
 			if (port.length() && !configuration.setJsonNumberFromText(updates, "MQTTPort", port.c_str())) {
 				configError();
-				Server.send(400, "text/plain", configuration.lastError());
+				http.server().send(400, "text/plain", configuration.lastError());
 				return;
 			}
 			host = host.substring(0, colon);
@@ -1482,7 +1473,7 @@ void rootPage() {
 		updates["MQTTBroker"] = host;
 		if (!configuration.applyAndSave(updates)) {
 			configError();
-			Server.send(400, "text/plain", configuration.lastError());
+			http.server().send(400, "text/plain", configuration.lastError());
 			return;
 		}
 		if (host.length()) {
@@ -1493,9 +1484,9 @@ void rootPage() {
 		}
 	}
 
-	if(Server.hasArg(F("set"))) {
-		String state = Server.arg(F("state"));
-		String deviceNum = Server.arg(F("device-num"));
+	if(http.server().hasArg(F("set"))) {
+		String state = http.server().arg(F("state"));
+		String deviceNum = http.server().arg(F("device-num"));
 
 		byte relay;
 #ifdef USE_RELAY_0
@@ -1538,52 +1529,17 @@ void rootPage() {
 
 	serializeJsonPretty(doc, data, sizeof(data));
 
-	Server.send(200, "application/json", data);
+	http.server().send(200, "application/json", data);
 }
 
 
-bool clearMessage(void* opaque) 
-{
-	D("");
-			
-	return true;
-}
-
-void clearDisplay() 
-{
-	display.clearDisplay();
-	display.setCursor(0,0);
-	display.display();
-	
-	for(int i = 0; i < DISPLAY_LINES; i++)
-		screen.lines[i] = String();
-}
-
-void D(String m)
-{
-	for(int i = 0; i < DISPLAY_LINES-1; i++) {
-		screen.lines[i] = screen.lines[i + 1];
-	}
-	screen.lines[DISPLAY_LINES-1] = m;
-	
+// Send diagnostic messages to the shared display, optionally mirroring them to Serial.
+void D(const String& message) {
 #ifdef DEBUG_D
-	Serial.println("D: " + m);
+	Serial.println("D: " + message);
 #endif
 
-	display.clearDisplay();
-	display.setCursor(0,0);
-	
-	for(int i = 0; i < DISPLAY_LINES; i++) {
-		display.println(screen.lines[i]);
-//		Serial.println("D[" + String(i) + "]: " + screen.lines[i]);
-	}
-
-	if(m.length() != 0) {
-		timer.cancel(scrollTimer);
-		scrollTimer = timer.every(DISPLAY_TIMEOUT, clearMessage, (void *)0);
-	}
-
-	display.display();
+	display.D(message);
 }
 
 static void setupSystem() {
@@ -1601,32 +1557,10 @@ static void setupSystem() {
 }
 
 
-void setupDisplay()
-{
-#if IS_ESP32
+// Initialize the board's I2C bus and OLED; welcome() reports failure once Serial is ready.
+void setupDisplay() {
 	Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
-#endif
-	if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { // Address 0x3C for 128x32
-		Serial.println(F("SSD1306 allocation failed"));
-		for(;;); // Don't proceed, loop forever
-	}
-
-#ifdef ROTATE_DISPLAY
-	display.setRotation(2);
-#endif
-	clearDisplay();
-
-	display.setTextSize(1);
-	display.setTextColor(SSD1306_WHITE);
-	display.setTextWrap(false);
-	display.setCursor(0,0);
-
-	display.display();
-
-	for(int i = 0; i < DISPLAY_LINES; i++)
-		screen.lines[i] = String();
-
-	scrollTimer = timer.every(DISPLAY_TIMEOUT, clearMessage, (void *)0);
+	display.setup();
 }
 
 
@@ -1663,12 +1597,11 @@ void setupDFP() {
 }
 
 
+// Show the startup banner and blink the LED, continuing when no OLED is available.
 void welcome() {
-	display.clearDisplay();
+	display.clear();
 
-	display.setCursor(0,0);
-
-	for(int i = 0; i < 3; i++) {
+	for (int i = 0; i < 3; i++) {
 		digitalWrite(PIN_LED, 0);
 		delay(50);
 		digitalWrite(PIN_LED, 1);
@@ -1676,23 +1609,23 @@ void welcome() {
 	}
 
 	Serial.print(F("MQTT Agent, V "));
-	Serial.print(VERSION); 
-	Serial.println(F(". Copyright (C) 2026, Marc D. Spencer")); 
+	Serial.print(VERSION);
+	Serial.println(F(". Copyright (C) 2026, Marc D. Spencer"));
 
-	display.print(F("MQTT Agent, V"));
-	display.println(VERSION); 
-	display.println(); 
-	display.println(F("(C) 2026"));
-	display.println(F("Marc D. Spencer")); 
+	if (!display.ready()) {
+		Serial.println(F("OLED initialization failed; continuing without display."));
+	}
 
-	display.display();
+	D(String(F("MQTT Agent, V")) + VERSION);
+	D("");
+	D(F("(C) 2026"));
+	D(F("Marc D. Spencer"));
 
 	digitalWrite(PIN_LED, 0);
 	delay(5000);
 	digitalWrite(PIN_LED, 1);
 
-	display.clearDisplay();
-	display.display();
+	display.clear();
 }
 
 
@@ -1810,6 +1743,7 @@ void mqttSubscribe() {
 }
 
 
+// Initialize hardware, configuration, application routes, Wi-Fi, and MQTT.
 void setup() {
 	delay(100);
 	
@@ -1942,7 +1876,10 @@ owInventory();
 
 // ----------- WiFi -----------------------------------------------------------
 
-	Server.on("/", rootPage);
+	// Register all application routes before Wi-Fi startup can return early.
+	http.server().on("/", rootPage);
+	http.server().on("/upload", HTTP_GET, handleUploadPage);
+	http.server().on("/upload", HTTP_POST, handleUploadPost, handleUploadStream);
 	
 	// Reset button logic: if held, force portal + clear stored WiFi creds
 	bool forcePortal = false;
@@ -1969,7 +1906,6 @@ owInventory();
 			wifiProvisioning = true;
 		}
 
-		Server.begin();
 	} else {
 		Serial.println(F("WiFi: Connect failed. Retrying."));
 		wifiNextRetry = millis() + 1000UL;
@@ -1977,6 +1913,10 @@ owInventory();
 		wifiProvisioning = false;
 	}
 	
+	if (wifiEverUp) {
+		http.begin();
+	}
+
 	// Bail if we failed WiFi.
 	if(!wifiEverUp) 
 		return;
@@ -1985,13 +1925,6 @@ owInventory();
 	if (is_reset == LOW)
 		return;
 	
-// ----------- Upload -------------------------------------------------------
-
-Server.on("/upload", HTTP_GET, handleUploadPage);
-Server.on("/upload", HTTP_POST, handleUploadPost, handleUploadStream);
-
-// -----------        -------------------------------------------------------
-
 #ifdef USE_DFPLAYER
 	Serial.println(F("DFP: Setup."));
 	setupDFP();
@@ -2031,7 +1964,11 @@ void reboot() {
 #endif
 }
 
+// Service display scrolling, network connections, timers, and device inputs.
 void loop() {
+	// Scroll diagnostics even when Wi-Fi is unavailable or provisioning is pending.
+	display.tick();
+
 	if (millis() >= rebootTime) {
 		reboot();
 	}
@@ -2041,12 +1978,12 @@ void loop() {
 	}
 	
 	if (wifiProvisioning) {
-		if (wifiReady()) {
-			wifiProvisioning = false;
-			wifiEverUp = true;
+		if (!wifiReady()) {
+			http.stop();
+			return;
 		}
 
-		return;
+		wifiProvisioning = false;
 	}
 	
 	// only here:
@@ -2055,6 +1992,7 @@ void loop() {
 	bool wasUp = wifiEverUp;
 
 	if(!wifiReady()) {
+		http.stop();
 		wifiEverUp = false;
 
 		// Optional: only log on transition
@@ -2081,6 +2019,9 @@ void loop() {
  		lastMQTTOnlineCheck = 0; // force immediate MQTT attempt
 	}
 
+	// begin() is idempotent; resume HTTP after association and DHCP are ready.
+	http.begin();
+
 	bool isConnected = client.loop();
 	if((strlen(appConfig.MQTTBroker) > 0) && !isConnected) {
 		if(millis() > lastMQTTOnlineCheck) {
@@ -2097,7 +2038,7 @@ void loop() {
 		}
 	}
 
-	Server.handleClient();
+	http.tick();
 	delay(0);
 
 	if (shouldReboot) {
