@@ -2,6 +2,7 @@
 #include "AgentConfig.h"
 #include <MDS_Display.h>
 #include <MDS_HTTP.h>
+#include <MDS_WiFi.h>
 
 // ---- Configuration -------------------------------------------------------------------
 //
@@ -27,9 +28,7 @@
 	#include <ESP8266WiFi.h>
 #elif IS_ESP32
 	#include <WiFi.h>
-	#include <esp_mac.h>
 #endif
-#include <WiFiManager.h>
 #include <Update.h>
 #include <ArduinoJson.h>
 #include <PubSubClient.h>
@@ -57,7 +56,6 @@
 
 
 #define VERSION				"2.2"
-#define ACCESSPOINT_NAME	"MQA"
 
 // #define DEBUG_D						// Mirror screen to serial
 
@@ -134,7 +132,6 @@
 #define	DFPLAYER_RESET			3600	// Time(s) between resetting DFPlayer
 #define ONLINE_CHECK_PERIOD 	10000	// Time(ms) between checks to see if we're still online
 #define REBOOT_DAYS				7		// Reboot every N days
-#define WIFI_RETRY_PERIOD		10000UL	// Time(ms) between WiFi connection retries
 #define REBOOT_BUTTON_TIME		10000	// Time(ms) WiFi button down to cause Reboot
 
 #ifdef RELAY_POSITIVE_LOGIC
@@ -147,7 +144,10 @@
 
 #define MS_PER_DAY				(24UL * 60UL * 60UL * 1000UL)
 
-char				systemID[32];		// System ID. Based on the WiFi MAC
+MDS_WiFi wifi;
+
+// Borrow the library's stable MAC-based identity for MQTT topics and payloads.
+const char* const systemID = wifi.systemID();
 
 MDS_HTTP http;
 
@@ -197,10 +197,9 @@ Timer<>::Task		dfplayerTimer;
 auto					timer = timer_create_default();
 unsigned long			lastMQTTOnlineCheck;
 static unsigned long	rebootPressedTime = 0;
-static uint32_t			wifiIdleSince = 0;
-static unsigned long	wifiNextRetry = 0;
-static bool				wifiEverUp = false;
-static bool				wifiProvisioning = false;
+
+// Track readiness transitions only to restart MQTT connection attempts.
+static bool wifiWasReady = false;
 
 static uint32_t	rebootTime = (uint32_t)((uint32_t)REBOOT_DAYS * MS_PER_DAY);
 
@@ -221,18 +220,10 @@ static void handleUploadPage();
 static void handleUploadPost();
 static void handleUploadStream();
 
-// === WiFi Manager
-static 					WiFiManager wm;
-static bool 			wmShouldSave = false;
-static bool				wmParamsAdded = false;
-
-static void wmSaveCallback() {
-	wmShouldSave = true;
-}
-
-static char wmMqttPort[6];     // "65535" + NUL
-static char wmTempRate[6];
-static char wmStatusRate[6];
+// Application-owned provisioning fields; MDS_WiFi owns WiFiManager.
+static char portalMqttPort[6];     // "65535" + NUL
+static char portalTemperatureRate[6];
+static char portalStatusRate[6];
 
 static WiFiManagerParameter pMqttBroker(
 	"mqttBroker",
@@ -244,22 +235,22 @@ static WiFiManagerParameter pMqttBroker(
 static WiFiManagerParameter pMqttPort(
 	"mqttPort",
 	"MQTT Port",
-	wmMqttPort,
-	sizeof(wmMqttPort)
+	portalMqttPort,
+	sizeof(portalMqttPort)
 );
 
 static WiFiManagerParameter pTempRate(
 	"tempRate",
 	"Temperature Update Rate (s)",
-	wmTempRate,
-	sizeof(wmTempRate)
+	portalTemperatureRate,
+	sizeof(portalTemperatureRate)
 );
 
 static WiFiManagerParameter pStatusRate(
 	"statusRate",
 	"Status Update Rate (s)",
-	wmStatusRate,
-	sizeof(wmStatusRate)
+	portalStatusRate,
+	sizeof(portalStatusRate)
 );
 
 // Report configuration errors and apply the current fallback settings.
@@ -371,200 +362,53 @@ void dfpPrintDetail(uint8_t type, int value) {
 }
 #endif
 
-void configModeCallback(WiFiManager *myWM) {
-  Serial.println("WiFi: Failed to Connect.");
-  Serial.println("WiFi: Portal " + String(myWM->getConfigPortalSSID()));
+// Validate the portal's application settings together and save them through AgentConfig.
+static void savePortalConfig() {
+	JsonDocument updates;
+	updates["MQTTBroker"] = pMqttBroker.getValue();
 
-  D("Failed to Connect.");
-  D(" ");
-  D(String(myWM->getConfigPortalSSID()));
+	if (!configuration.setJsonNumberFromText(updates, "MQTTPort", pMqttPort.getValue())
+		|| !configuration.setJsonNumberFromText(updates, "temperatureUpdateRate", pTempRate.getValue())
+		|| !configuration.setJsonNumberFromText(updates, "statusUpdateRate", pStatusRate.getValue())
+		|| !configuration.applyAndSave(updates)) {
+		configError();
+	}
 }
 
-
-static bool wifiBegin(bool forcePortal) {
-	wmShouldSave = false;
-
-	uint16_t portForUi   = appConfig.MQTTPort;
-	uint16_t tempForUi   = appConfig.temperatureUpdateRate;
-	uint16_t statusForUi = appConfig.statusUpdateRate;
-	
-	snprintf(wmMqttPort,   sizeof(wmMqttPort),   "%u", (unsigned)portForUi);
-	snprintf(wmTempRate,   sizeof(wmTempRate),   "%u", (unsigned)tempForUi);
-	snprintf(wmStatusRate, sizeof(wmStatusRate), "%u", (unsigned)statusForUi);
+// Populate the portal fields and start the library's existing connection/provisioning policy.
+static void setupWiFi(bool forcePortal) {
+	snprintf(portalMqttPort, sizeof(portalMqttPort), "%u", (unsigned)appConfig.MQTTPort);
+	snprintf(portalTemperatureRate, sizeof(portalTemperatureRate), "%u", (unsigned)appConfig.temperatureUpdateRate);
+	snprintf(portalStatusRate, sizeof(portalStatusRate), "%u", (unsigned)appConfig.statusUpdateRate);
 
 	pMqttBroker.setValue(appConfig.MQTTBroker, sizeof(appConfig.MQTTBroker));
-	pMqttPort.setValue(wmMqttPort, sizeof(wmMqttPort));
-	pTempRate.setValue(wmTempRate, sizeof(wmTempRate));
-	pStatusRate.setValue(wmStatusRate, sizeof(wmStatusRate));
+	pMqttPort.setValue(portalMqttPort, sizeof(portalMqttPort));
+	pTempRate.setValue(portalTemperatureRate, sizeof(portalTemperatureRate));
+	pStatusRate.setValue(portalStatusRate, sizeof(portalStatusRate));
 
-	// Fresh manager state each time we enter provisioning
-	wm.setSaveConfigCallback(wmSaveCallback);
-	wm.setBreakAfterConfig(true);
-	wm.setConnectTimeout(20);
-	wm.setConfigPortalTimeout(180);
-	
-	if(!wmParamsAdded) {
-		wm.addParameter(&pMqttBroker);
-		wm.addParameter(&pMqttPort);
-		wm.addParameter(&pTempRate);
-		wm.addParameter(&pStatusRate);
-		wmParamsAdded = true;
-	}	
+	wifi.addParameter(pMqttBroker);
+	wifi.addParameter(pMqttPort);
+	wifi.addParameter(pTempRate);
+	wifi.addParameter(pStatusRate);
 
-	WiFi.mode(WIFI_STA);
+	wifi.setStatusCallback(D);
+	wifi.setSaveCallback(savePortalConfig);
 
-	char apName[32];
-	snprintf(apName, sizeof(apName), "%s %s", ACCESSPOINT_NAME, systemID);
-	const char* apPass = "12345678";
+	MDS_WiFi::Options options;
+	options.accessPointPrefix = "MQA";
+	options.accessPointPassword = "12345678";
+	options.portalTitle = "Agent Configuration";
+	options.connectionPolicy = MDS_WiFi::ConnectionPolicy::Legacy;
 
-	static const char wmHead[] PROGMEM = R"rawliteral(
-<style>
-:root{--bg:#000000;--text:#fff;--card:#20202080;--border:rgba(43,14,161,.75);--shadow:0 12px 30px rgba(0,0,0,.10);--radius:8px;}
-html,body{height:100%;}
-body{margin:0;color:var(--text);background:var(--bg);font-family:Helvetica,Arial,sans-serif;}
-/* card-ish main container */
-main, .wrap, .content, form{max-width:560px;margin:4px auto;padding:8px;background:var(--card);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);}
-button{padding:12px;}
-.wrap{display:block;}
-h1,h2,h3{margin:0 0 14px 0;font-size:18px;font-weight:600;background:inherit;}
-h3{font-size:12px;font-weight:300;}
-input,button,select{font:inherit;}
-button,input[type=submit]{border-radius:var(--radius);cursor:pointer;background-color:#c4c4c4;color:#000;font-weight:600}
-</style>
-	)rawliteral";
-
-	wm.setCustomHeadElement(wmHead);
-	wm.setDarkMode(true);
-	wm.setTitle("Agent Configuration");
-	wm.setAPCallback(configModeCallback);
- 	wm.setDebugOutput(false);
-
-	bool ok = false;
-	if(forcePortal) {
-		Serial.println(F("WiFi: Start Config Portal"));
-		ok = wm.startConfigPortal(apName, apPass);
-	} else {
-		Serial.println(F("WiFi: Auto Connect"));
-		D(F("Connecting ..."));
-		ok = wm.autoConnect(apName, apPass);
-	}
-
-	if (!ok) {
-		Serial.println(F("WiFiManager: failed to connect, portal exited."));
-		return false;
-	}
-
-	D(F("Connected."));
-
-	// Validate portal edits together before persisting or changing runtime values.
-	if (wmShouldSave) {
-		JsonDocument updates;
-		updates["MQTTBroker"] = pMqttBroker.getValue();
-		if (!configuration.setJsonNumberFromText(updates, "MQTTPort", pMqttPort.getValue())
-			|| !configuration.setJsonNumberFromText(updates, "temperatureUpdateRate", pTempRate.getValue())
-			|| !configuration.setJsonNumberFromText(updates, "statusUpdateRate", pStatusRate.getValue())
-			|| !configuration.applyAndSave(updates)) {
-			configError();
-		}
-	}
-
-	return true;
-}
-
-
-static bool wifiReady() {
-// Serial.print("wifiReady() ");
-// 	wl_status_t st = (wl_status_t)WiFi.status();
-// 	Serial.printf("WiFi: Retry. st=%s mode=%d.\n",
-// 		wifiStatusStr(st),
-// 		(int)WiFi.getMode());
-
-	if(WiFi.status() != WL_CONNECTED) return false;
-	IPAddress ip = WiFi.localIP();
-
-	return (ip[0] != 0 || ip[1] != 0 || ip[2] != 0 || ip[3] != 0);
-}
-
-static const char* wifiStatusStr(wl_status_t st) {
-	switch(st) {
-		case WL_IDLE_STATUS:     return "IDLE";
-		case WL_NO_SSID_AVAIL:   return "NO_SSID";
-		case WL_SCAN_COMPLETED:  return "SCAN_DONE";
-		case WL_CONNECTED:       return "CONNECTED";
-		case WL_CONNECT_FAILED:  return "CONNECT_FAILED";
-		case WL_CONNECTION_LOST: return "CONNECTION_LOST";
-		case WL_DISCONNECTED:    return "DISCONNECTED";
-		default:                 return "UNKNOWN";
-	}
-}
-
-static void wifiConnect() {
-	WiFi.mode(WIFI_STA);
-	WiFi.begin();
-}
-
-static void wifiRetryTick() {
-	if(wifiReady()) {
-		wifiIdleSince = 0;
-		return;
-	}
-
-	uint32_t now = millis();
-	if((int32_t)(now - wifiNextRetry) < 0) return;
-
-// 	Serial.println(F("WiFi: wifiRetryTick()"));
-	
-	wl_status_t st = (wl_status_t)WiFi.status();
-	IPAddress ip = WiFi.localIP();
-
-	Serial.printf("WiFi: Retry. st=%s mode=%d ip=%s.\n",
-		wifiStatusStr(st),
-		(int)WiFi.getMode(),
-		ip.toString().c_str());
-
-	// Track how long we've been stuck in IDLE
-	if(st == WL_IDLE_STATUS) {
-		if(!wifiIdleSince) wifiIdleSince = now;
-	} else if(st == WL_NO_SSID_AVAIL) {
-		Serial.println(F("WiFi: No SSID. Giving up."));
-		D("Timeout."); 
-		rebootTime = 0; // very in the past. Reboot.
-	} else {
-		wifiIdleSince = 0;
-	}
-
-	// Case 1: "CONNECTED but no IP" => bounce DHCP by cycling link
-	if (st == WL_CONNECTED && ip == IPAddress(0, 0, 0, 0)) {
-		Serial.println(F("WiFi: Connected, No-IP -> disconnect + reconnect."));
-		WiFi.disconnect(false);
-		delay(200);
-		wifiConnect();
-		wifiNextRetry = now + 2000UL;
-		return;
-	}
-
-	// Case 2: If we've been IDLE too long, force a reconnect
-	if(wifiIdleSince && (uint32_t)(now - wifiIdleSince) > 15000UL) {
-		Serial.println(F("WiFi: IDLE -> reconnecting."));
-		wifiIdleSince = 0;
-
-		WiFi.disconnect(false);
-		delay(200);
-
-		wifiConnect();
-
-		wifiNextRetry = now + 5000UL;
-		return;
-	}
-
-	wifiConnect();
-	wifiNextRetry = now + WIFI_RETRY_PERIOD;
+	wifi.begin(options, forcePortal);
 }
 
 // Serve the existing browser form for uploading a firmware binary.
 static void handleUploadPage()
 {
-	if(!wifiEverUp) return;
+	if (!wifi.ready()) {
+		return;
+	}
 
 	// Minimal page: choose .bin and POST it
 	static const char uploadHtml[] =
@@ -1425,7 +1269,9 @@ DynamicJsonDocument getStatusAsJSON() {
 
 // Apply query-string controls and return the current agent status as JSON.
 void rootPage() {
-	if(!wifiEverUp) return;
+	if (!wifi.ready()) {
+		return;
+	}
 	
 	char	data[512];
 
@@ -1541,21 +1387,6 @@ void D(const String& message) {
 
 	display.D(message);
 }
-
-static void setupSystem() {
-	uint8_t mac[6] = {0};
-
-#if IS_ESP32
-	esp_read_mac(mac, ESP_MAC_BASE);
-#else
-	WiFi.macAddress(mac);
-#endif
-
-	snprintf(systemID, sizeof(systemID),
-		"%02X:%02X:%02X:%02X:%02X:%02X",
-		mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-}
-
 
 // Initialize the board's I2C bus and OLED; welcome() reports failure once Serial is ready.
 void setupDisplay() {
@@ -1774,7 +1605,6 @@ void setup() {
 
 	delay(1000);
 
-	setupSystem();
 	setupDisplay();
 
 	int is_reset = 0;
@@ -1881,46 +1711,16 @@ owInventory();
 	http.server().on("/upload", HTTP_GET, handleUploadPage);
 	http.server().on("/upload", HTTP_POST, handleUploadPost, handleUploadStream);
 	
-	// Reset button logic: if held, force portal + clear stored WiFi creds
-	bool forcePortal = false;
-	if (is_reset == LOW) {
-		Serial.println(F("WiFi: Reset requested. Clearing WiFi credentials."));
-		wm.resetSettings();
-		WiFi.disconnect(true);
-		delay(200);
-		forcePortal = true;
-		wifiProvisioning = true;
-	}
-	
-	// Start WiFi (autoConnect unless forced)
-	bool ok = wifiBegin(forcePortal);
-	if (ok) {
-		if (wifiReady()) {
-			Serial.print(F("WiFi IP: "));
-			Serial.println(WiFi.localIP());
-			wifiEverUp = true;
-			wifiProvisioning = false;
-		} else {
-			Serial.println(F("WiFi: connected/portal done; STA not up yet"));
-			wifiEverUp = false;
-			wifiProvisioning = true;
-		}
+	// Holding reset at boot clears saved credentials and forces the configuration portal.
+	setupWiFi(is_reset == LOW);
+	wifiWasReady = wifi.ready();
 
-	} else {
-		Serial.println(F("WiFi: Connect failed. Retrying."));
-		wifiNextRetry = millis() + 1000UL;
-		wifiEverUp = false;
-		wifiProvisioning = false;
-	}
-	
-	if (wifiEverUp) {
-		http.begin();
-	}
-
-	// Bail if we failed WiFi.
-	if(!wifiEverUp) 
+	if (!wifiWasReady) {
 		return;
-		
+	}
+
+	http.begin();
+
 	// Bail out of rest of setup if reset held
 	if (is_reset == LOW)
 		return;
@@ -1977,46 +1777,22 @@ void loop() {
 		reboot();
 	}
 	
-	if (wifiProvisioning) {
-		if (!wifiReady()) {
-			http.stop();
-			return;
-		}
+	wifi.tick();
 
-		wifiProvisioning = false;
+	// The library requests the Legacy no-SSID reboot; the application performs it.
+	if (wifi.rebootRequested()) {
+		rebootTime = 0;
 	}
-	
-	// only here:
-	wifiRetryTick();
-	
-	bool wasUp = wifiEverUp;
 
-	if(!wifiReady()) {
+	if (!wifi.ready()) {
 		http.stop();
-		wifiEverUp = false;
-
-		// Optional: only log on transition
-		if(wasUp) {
-			D(F("WiFi: Unavailable"));
-			Serial.println(F("WiFi: Unavailable"));
-		}
-
+		wifiWasReady = false;
 		return;
 	}
 
-	// WiFi is up
-	if(!wasUp) {
-		D(F("WiFi: Available"));
-		Serial.println(F("WiFi: Available"));
-		wifiEverUp = true;
-		wifiProvisioning = false;
-#if IS_ESP8266
-		WiFi.setAutoConnect(true);
-		WiFi.setAutoReconnect(true);
-#elif IS_ESP32
-		WiFi.setAutoReconnect(true);
-#endif
- 		lastMQTTOnlineCheck = 0; // force immediate MQTT attempt
+	if (!wifiWasReady) {
+		lastMQTTOnlineCheck = 0;
+		wifiWasReady = true;
 	}
 
 	// begin() is idempotent; resume HTTP after association and DHCP are ready.
