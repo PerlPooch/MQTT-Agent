@@ -436,6 +436,18 @@ static void savePortalConfig() {
 	}
 }
 
+// Log all Wi-Fi messages to Serial and keep detailed diagnostics off the small OLED.
+static void reportWiFiStatus(const String& message) {
+	Serial.println(message);
+
+	const bool concise = strncmp(message.c_str(), "WiFi", 4) != 0
+		|| message == "WiFi: Available" || message == "WiFi: Unavailable";
+
+	if (concise) {
+		display.D(message);
+	}
+}
+
 // Populate portal fields and retry saved Wi-Fi in the background until the AP returns.
 static void setupWiFi(MDS_WiFi::StartupMode mode) {
 	snprintf(portalMqttPort, sizeof(portalMqttPort), "%u", (unsigned)appConfig.MQTTPort);
@@ -456,7 +468,7 @@ static void setupWiFi(MDS_WiFi::StartupMode mode) {
 	wifi.addParameter(pStatusRate);
 	wifi.addParameter(pRelayDuration);
 
-	wifi.setStatusCallback(D);
+	wifi.setStatusCallback(reportWiFiStatus);
 	wifi.setSaveCallback(savePortalConfig);
 
 	MDS_WiFi::Options options;
