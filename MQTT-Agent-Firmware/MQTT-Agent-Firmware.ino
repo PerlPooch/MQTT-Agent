@@ -3,6 +3,7 @@
 #include <MDS_Display.h>
 #include <MDS_HTTP.h>
 #include <MDS_WiFi.h>
+#include "uiHtml.h"
 
 // ---- Configuration -------------------------------------------------------------------
 //
@@ -55,7 +56,7 @@
 #endif
 
 
-#define VERSION				"2.3"
+#define VERSION				"2.4"
 
 // #define DEBUG_D						// Mirror screen to serial
 
@@ -126,7 +127,6 @@
 
 #define DHT_TYPE				DHT11
 
-#define	RELAY_TIMEOUT			500 	// Time(ms) for relay pulses
 #define	HAPPY_PERIOD			5000	// Time(ms) for happy LED blinks
 #define	HAPPY_NOMQTT_PERIOD		10000	// Time(ms) for happy LED blinks
 #define	DFPLAYER_RESET			3600	// Time(s) between resetting DFPlayer
@@ -135,11 +135,11 @@
 #define REBOOT_BUTTON_TIME		10000	// Time(ms) WiFi button down to cause Reboot
 
 #ifdef RELAY_POSITIVE_LOGIC
-	#define LOGIC_HIGH 1
-	#define LOGIC_LOW 0
+	#define R_LOGIC_HIGH 1
+	#define R_LOGIC_LOW 0
 #else
-	#define LOGIC_HIGH 0
-	#define LOGIC_LOW 1
+	#define R_LOGIC_HIGH 0
+	#define R_LOGIC_LOW 1
 #endif
 
 #define MS_PER_DAY				(24UL * 60UL * 60UL * 1000UL)
@@ -216,6 +216,9 @@ struct temperature_t {
 // === Upload/Update
 static volatile bool shouldReboot = false;
 
+// === Display
+void D(const String& message);
+
 static void handleUploadPage();
 static void handleUploadPost();
 static void handleUploadStream();
@@ -224,6 +227,7 @@ static void handleUploadStream();
 static char portalMqttPort[6];     // "65535" + NUL
 static char portalTemperatureRate[6];
 static char portalStatusRate[6];
+static char portalRelayPulse[6];
 
 static WiFiManagerParameter pMqttBroker(
 	"mqttBroker",
@@ -253,6 +257,13 @@ static WiFiManagerParameter pStatusRate(
 	sizeof(portalStatusRate)
 );
 
+static WiFiManagerParameter pRelayDuration(
+	"relayDuration",
+	"Relay Pulse (ms)",
+	portalRelayPulse,
+	sizeof(portalRelayPulse)
+);
+
 // Report configuration errors and apply the current fallback settings.
 static bool configError() {
 	Serial.print(F("Config: "));
@@ -277,10 +288,59 @@ static bool setConfigNumber(const char* key, const String& text) {
 	return true;
 }
 
+// Build a bounded MQTT topic using the agent's MAC-based identity.
+static void makeDeviceTopic(char* out, size_t outSize, const char* device) {
+	snprintf(out, outSize, "spencer/%s/%s", systemID, device);
+}
+
 bool lastStatus0 = false, lastStatus1 = false;
 bool reset_is_down = false;
 
 
+// Format the firmware compilation date and time for diagnostics and the web UI.
+static String getBuildDate() {
+	const char *date = __DATE__;	// "Mmm dd yyyy"
+	const char *time = __TIME__;	// "hh:mm:ss"
+
+	char month[4];
+	char day[3];
+	char year[5];
+	char iso[20];
+
+	month[0] = date[0];
+	month[1] = date[1];
+	month[2] = date[2];
+	month[3] = '\0';
+
+	day[0] = (date[4] == ' ') ? '0' : date[4];
+	day[1] = date[5];
+	day[2] = '\0';
+
+	year[0] = date[7];
+	year[1] = date[8];
+	year[2] = date[9];
+	year[3] = date[10];
+	year[4] = '\0';
+
+	const char *monthNum = "00";
+
+	if(strcmp(month, "Jan") == 0) monthNum = "01";
+	else if(strcmp(month, "Feb") == 0) monthNum = "02";
+	else if(strcmp(month, "Mar") == 0) monthNum = "03";
+	else if(strcmp(month, "Apr") == 0) monthNum = "04";
+	else if(strcmp(month, "May") == 0) monthNum = "05";
+	else if(strcmp(month, "Jun") == 0) monthNum = "06";
+	else if(strcmp(month, "Jul") == 0) monthNum = "07";
+	else if(strcmp(month, "Aug") == 0) monthNum = "08";
+	else if(strcmp(month, "Sep") == 0) monthNum = "09";
+	else if(strcmp(month, "Oct") == 0) monthNum = "10";
+	else if(strcmp(month, "Nov") == 0) monthNum = "11";
+	else if(strcmp(month, "Dec") == 0) monthNum = "12";
+
+	snprintf(iso, sizeof(iso), "%s-%s-%sT%.8s", year, monthNum, day, time);
+
+	return String(iso);
+}
 
 #ifdef USE_DFPLAYER
 void dfpPrintDetail(uint8_t type, int value) {
@@ -320,7 +380,7 @@ void dfpPrintDetail(uint8_t type, int value) {
 			D("Play " + String(value) + " finished.");
 #ifdef PLAY_TRIGGER_RELAY_0
 			delay(200);
-			digitalWrite(PIN_RELAY_0, LOGIC_LOW);
+			digitalWrite(PIN_RELAY_0, R_LOGIC_LOW);
 #endif
 #ifdef USE_MIDI
 			midiA.sendNoteOff(61, 0, 1);     // Stop the note
@@ -370,6 +430,7 @@ static void savePortalConfig() {
 	if (!configuration.setJsonNumberFromText(updates, "MQTTPort", pMqttPort.getValue())
 		|| !configuration.setJsonNumberFromText(updates, "temperatureUpdateRate", pTempRate.getValue())
 		|| !configuration.setJsonNumberFromText(updates, "statusUpdateRate", pStatusRate.getValue())
+		|| !configuration.setJsonNumberFromText(updates, "relayPulseDuration", pRelayDuration.getValue())
 		|| !configuration.applyAndSave(updates)) {
 		configError();
 	}
@@ -381,15 +442,19 @@ static void setupWiFi(bool forcePortal) {
 	snprintf(portalTemperatureRate, sizeof(portalTemperatureRate), "%u", (unsigned)appConfig.temperatureUpdateRate);
 	snprintf(portalStatusRate, sizeof(portalStatusRate), "%u", (unsigned)appConfig.statusUpdateRate);
 
+	snprintf(portalRelayPulse, sizeof(portalRelayPulse), "%u", (unsigned)appConfig.relayPulseDuration);
+
 	pMqttBroker.setValue(appConfig.MQTTBroker, sizeof(appConfig.MQTTBroker));
 	pMqttPort.setValue(portalMqttPort, sizeof(portalMqttPort));
 	pTempRate.setValue(portalTemperatureRate, sizeof(portalTemperatureRate));
 	pStatusRate.setValue(portalStatusRate, sizeof(portalStatusRate));
+	pRelayDuration.setValue(portalRelayPulse, sizeof(portalRelayPulse));
 
 	wifi.addParameter(pMqttBroker);
 	wifi.addParameter(pMqttPort);
 	wifi.addParameter(pTempRate);
 	wifi.addParameter(pStatusRate);
+	wifi.addParameter(pRelayDuration);
 
 	wifi.setStatusCallback(D);
 	wifi.setSaveCallback(savePortalConfig);
@@ -514,6 +579,7 @@ void owAddressToCString(const uint8_t addr[8], char *out)
 }
 
 void owInventory() {
+#ifdef USE_1WIRE_TEMPERATURE
 	byte addr[8];
 	int count = 0;
 	char romStr[24];
@@ -543,6 +609,7 @@ void owInventory() {
 
 		Serial.println();
 	}
+#endif
 }
 
 bool clearRelay(void* opaque) {
@@ -561,7 +628,7 @@ bool clearRelay(void* opaque) {
 		return false;
 	}
 	
-	digitalWrite(relayPin, LOGIC_LOW);
+	digitalWrite(relayPin, R_LOGIC_LOW);
 	return false; // one-shot for SimpleTimer-style callbacks
 }
 
@@ -596,7 +663,7 @@ temperature_t updateTemperature(uint8_t index) {
 	if (!isnan(r.tempF))
 		r.valid = true;
 	else
-		r.tempF = 0.0f
+		r.tempF = 0.0f;
 #else
 	(void)index; // unused
 
@@ -639,10 +706,7 @@ bool publishTemperature(void* opaque) {
 	blinkLED(nullptr);
 
 	// Base topic: "spencer/<systemID>/temperature"
-	memset(baseTopic, 0, sizeof(baseTopic));
-	strncpy(baseTopic, "spencer/", sizeof(baseTopic) - 1);
-	strncat(baseTopic, systemID, sizeof(baseTopic) - strlen(baseTopic) - 1);
-	strncat(baseTopic, "/temperature", sizeof(baseTopic) - strlen(baseTopic) - 1);
+	makeDeviceTopic(baseTopic, sizeof(baseTopic), "temperature");
 
 	// Single-sensor topic is exactly baseTopic
     const char* legacyTopic = baseTopic;
@@ -709,7 +773,9 @@ bool publishTemperature(void* opaque) {
 		}
 		
 		// D(String(F("T")) + String(i) + F(": ") + String(t.tempF, 1) + F(" -> ") + String(publishTopic));
+#ifdef USE_1WIRE_TEMPERATURE
 		D(String(F("T")) + String(i) + F(": ") + String(t.tempF, 1));
+#endif
     }
 
 	if(sensorCount > 1) {
@@ -748,10 +814,7 @@ bool publishHumidity(void* opaque) {
 	String temp = updateHumidity();
 	D(String(F("Humd 0: ")) + temp);
 
-	memset(buf, 0, sizeof(buf));
-	strncpy(buf, "spencer/", sizeof(buf));
-	strcat(buf, systemID);
-	strcat(buf, "/humidity");
+	makeDeviceTopic(buf, sizeof(buf), "humidity");
 	
 	blinkLED((void *)0);
 	
@@ -788,10 +851,7 @@ bool publishStatus(void* opaque) {
 
 	D(String(F("Status: ")) + String(input0) + String(F(" ")) + String(input1));
 
-	memset(buf, 0, sizeof(buf));
-	strncpy(buf, "spencer/", sizeof(buf));
-	strcat(buf, systemID);
-	strcat(buf, "/status");
+	makeDeviceTopic(buf, sizeof(buf), "status");
 	
 	blinkLED((void *)0);
 	
@@ -815,10 +875,7 @@ bool publishReboot(void* opaque) {
 	bool	input0 = false;
 	bool	input1 = false;
 
-	memset(buf, 0, sizeof(buf));
-	strncpy(buf, "spencer/", sizeof(buf));
-	strcat(buf, systemID);
-	strcat(buf, "/reboot");
+	makeDeviceTopic(buf, sizeof(buf), "reboot");
 	
 	blinkLED((void *)0);
 	
@@ -863,10 +920,7 @@ bool publishRelays(void* opaque) {
 #endif
 	D(String(F("Relays: ")) + String(relay0) + String(F(" ")) + String(relay1));
 
-	memset(buf, 0, sizeof(buf));
-	strncpy(buf, "spencer/", sizeof(buf));
-	strcat(buf, systemID);
-	strcat(buf, "/relay");
+	makeDeviceTopic(buf, sizeof(buf), "relay");
 	
 	blinkLED((void *)0);
 	
@@ -894,10 +948,7 @@ bool publishPlayStatus(void* opaque, int item, String status) {
 	char	data[200];
 	char	buf[64];
 
-	memset(buf, 0, sizeof(buf));
-	strncpy(buf, "spencer/", sizeof(buf));
-	strcat(buf, systemID);
-	strcat(buf, "/trigger");
+	makeDeviceTopic(buf, sizeof(buf), "trigger");
 	
 	blinkLED((void *)0);
 	
@@ -1030,6 +1081,12 @@ void callback(char* in_topic, byte* in_message, unsigned int length) {
 			timer.cancel(statusTimer);
 			if(appConfig.statusUpdateRate > 0)
 				statusTimer = timer.every(appConfig.statusUpdateRate * 1000UL, publishStatus, (void *)0);
+		} else if (device == "relay") {
+			if (!setConfigNumber("relayPulseDuration", rate)) {
+				return;
+			}
+
+			D("Set-rate RDur: " + String(appConfig.relayPulseDuration));
 		}
  	} else if(command == "set") {
 		jsonValue = doc["device-num"] | "";
@@ -1067,18 +1124,18 @@ void callback(char* in_topic, byte* in_message, unsigned int length) {
 				blinkLED((void *)0);
 				D("Set Relay " + deviceNum + " On");
 
-				digitalWrite(relay, LOGIC_HIGH);
+				digitalWrite(relay, R_LOGIC_HIGH);
 			} else if(state == "off") {
 				blinkLED((void *)0);
 				D("Set Relay " + deviceNum + " Off");
 
-				digitalWrite(relay, LOGIC_LOW);
+				digitalWrite(relay, R_LOGIC_LOW);
 			} else if(state == "pulse") {
 				blinkLED((void *)0);
 				D("Set Relay " + deviceNum + " Pulse");
 
-				digitalWrite(relay, LOGIC_HIGH);
-				timer.in(RELAY_TIMEOUT, clearRelay, (void *)deviceNum.toInt());
+				digitalWrite(relay, R_LOGIC_HIGH);
+				timer.in(appConfig.relayPulseDuration, clearRelay, (void *)deviceNum.toInt());
 			}
 		}
  	} else if(command == "play") {
@@ -1097,7 +1154,7 @@ void callback(char* in_topic, byte* in_message, unsigned int length) {
 		midiA.sendNoteOn(61, 127, 1);    // Send a Note (pitch 42, velo 127 on channel 1)
 #endif
 #ifdef PLAY_TRIGGER_RELAY_0
-		digitalWrite(PIN_RELAY_0, LOGIC_HIGH);
+		digitalWrite(PIN_RELAY_0, R_LOGIC_HIGH);
 #endif
 #if defined (PLAY_TRIGGER_RELAY_0) || defined (USE_MIDI)
 		delay(200);
@@ -1118,6 +1175,7 @@ DynamicJsonDocument getStatusAsJSON() {
 	DynamicJsonDocument doc(512);
 
 	doc["version"] = String(VERSION);
+	doc["build"] = getBuildDate();
 
 	if (WiFi.status() == WL_CONNECTED) {
 		long rssi = WiFi.RSSI();
@@ -1219,9 +1277,7 @@ DynamicJsonDocument getStatusAsJSON() {
 #else
 			strcpy(idStripped, "0");
 #endif
-			memset(key, 0, sizeof(key));
-			strncpy(key, "temperature-", sizeof(key) - 1);
-			strncat(key, idStripped, sizeof(key) - strlen(key) - 1);
+			snprintf(key, sizeof(key), "temperature-%s", idStripped);
 
 			snprintf(tempStr, sizeof(tempStr), "%.1f", t.tempF);
 			doc[key] = tempStr;
@@ -1255,6 +1311,9 @@ DynamicJsonDocument getStatusAsJSON() {
 	doc["statusUpdateRate"] = (String)appConfig.statusUpdateRate;
 	doc["broker"] = (String)appConfig.MQTTBroker;
 	doc["brokerPort"] = (String)appConfig.MQTTPort;
+#if defined(USE_RELAY_0) || defined(USE_RELAY_1)
+	doc["relayPulseDuration"] = (String)appConfig.relayPulseDuration;
+#endif
 #if defined(USE_DHT11_TEMPERATURE)
 	String	humid = updateHumidity();
 	doc["humidity"] = humid;
@@ -1266,6 +1325,33 @@ DynamicJsonDocument getStatusAsJSON() {
 	return doc;
 }
 
+// Serve the upstream control UI with its cache and security headers.
+static void uiPage() {
+	if (!wifi.ready()) {
+		return;
+	}
+
+	http.server().sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+	http.server().sendHeader("Pragma", "no-cache");
+	http.server().sendHeader("Expires", "0");
+	http.server().sendHeader("X-Content-Type-Options", "nosniff");
+	http.server().sendHeader("X-Frame-Options", "DENY");
+	http.server().sendHeader("Referrer-Policy", "no-referrer");
+	http.server().sendHeader(
+		"Content-Security-Policy",
+		"default-src 'self'; "
+		"script-src 'self' 'unsafe-inline'; "
+		"style-src 'self' 'unsafe-inline'; "
+		"img-src 'self' data:; "
+		"connect-src 'self'; "
+		"object-src 'none'; "
+		"base-uri 'none'; "
+		"frame-ancestors 'none'; "
+		"form-action 'self'"
+	);
+
+	http.server().send_P(200, "text/html; charset=utf-8", uiHtml);
+}
 
 // Apply query-string controls and return the current agent status as JSON.
 void rootPage() {
@@ -1287,6 +1373,17 @@ void rootPage() {
 		if(appConfig.statusUpdateRate > 0)
 			statusTimer = timer.every(appConfig.statusUpdateRate * 1000UL, publishStatus, (void *)0);
 	}
+
+#if defined(USE_RELAY_0) || defined(USE_RELAY_1)
+	if (http.server().hasArg(F("relayPulseDuration"))) {
+		if (!setConfigNumber("relayPulseDuration", http.server().arg(F("relayPulseDuration")))) {
+			http.server().send(400, "text/plain", configuration.lastError());
+			return;
+		}
+
+		D("Set-rate RDur: " + String(appConfig.relayPulseDuration));
+	}
+#endif
 
 	if(http.server().hasArg(F("temperatureUpdateRate"))) {
 		if (!setConfigNumber("temperatureUpdateRate", http.server().arg(F("temperatureUpdateRate")))) {
@@ -1351,18 +1448,18 @@ void rootPage() {
 				blinkLED((void *)0);
 				D("Set Relay " + deviceNum + " On");
 
-				digitalWrite(relay, LOGIC_HIGH);
+				digitalWrite(relay, R_LOGIC_HIGH);
 			} else if(state == "off") {
 				blinkLED((void *)0);
 				D("Set Relay " + deviceNum + " Off");
 
-				digitalWrite(relay, LOGIC_LOW);
+				digitalWrite(relay, R_LOGIC_LOW);
 			} else if(state == "pulse") {
 				blinkLED((void *)0);
 				D("Set Relay " + deviceNum + " Pulse");
 
-				digitalWrite(relay, LOGIC_HIGH);
-				timer.in(RELAY_TIMEOUT, clearRelay, (void *)deviceNum.toInt());
+				digitalWrite(relay, R_LOGIC_HIGH);
+				timer.in(appConfig.relayPulseDuration, clearRelay, (void *)deviceNum.toInt());
 			}
 	}	
 	
@@ -1441,7 +1538,9 @@ void welcome() {
 
 	Serial.print(F("MQTT Agent, V "));
 	Serial.print(VERSION);
-	Serial.println(F(". Copyright (C) 2026, Marc D. Spencer"));
+	Serial.print(" (");
+	Serial.print(getBuildDate());
+	Serial.println(F("). Copyright (C) 2026, Marc D. Spencer"));
 
 	if (!display.ready()) {
 		Serial.println(F("OLED initialization failed; continuing without display."));
@@ -1493,9 +1592,7 @@ void mqttConnect() {
 	client.setCallback(callback);
 	client.setBufferSize(512);
 
-	memset(buf, 0, sizeof(buf));
-	strncpy(buf, "MQTT-Agent-", sizeof(buf)-1);
-	strncat(buf, systemID, sizeof(buf)-1);
+	snprintf(buf, sizeof(buf), "MQTT-Agent-%s", systemID);
 
 	if(client.connect(buf)) {
 		D(F("MQTT: Connected."));
@@ -1508,10 +1605,7 @@ void mqttConnect() {
 			
 		happyBlinkTimer = timer.every(HAPPY_PERIOD, blinkLED, (void *)0);
 
-		memset(buf, 0, sizeof(buf));
-		strncpy(buf, "spencer/", sizeof(buf)-1);
-		strncat(buf, systemID, sizeof(buf)-1);
-		strncat(buf, "/notice", sizeof(buf)-1);
+		makeDeviceTopic(buf, sizeof(buf), "notice");
 		
 		StaticJsonDocument<200> doc;
 		doc["id"] = systemID;
@@ -1580,12 +1674,12 @@ void setup() {
 	
 #if defined (USE_RELAY_0) || defined (PLAY_TRIGGER_RELAY_0)
 	pinMode(PIN_RELAY_0, OUTPUT);
-	digitalWrite(PIN_RELAY_0, LOGIC_LOW);
+	digitalWrite(PIN_RELAY_0, R_LOGIC_LOW);
 #endif
 
 #ifdef USE_RELAY_1
 	pinMode(PIN_RELAY_1, OUTPUT);
-	digitalWrite(PIN_RELAY_1, LOGIC_LOW);
+	digitalWrite(PIN_RELAY_1, R_LOGIC_LOW);
 #else
 	#if IS_ESP8266
  	pinMode(PIN_LED_1, OUTPUT);
@@ -1708,6 +1802,7 @@ owInventory();
 
 	// Register all application routes before starting Wi-Fi.
 	http.server().on("/", rootPage);
+	http.server().on("/ui", uiPage);
 	http.server().on("/upload", HTTP_GET, handleUploadPage);
 	http.server().on("/upload", HTTP_POST, handleUploadPost, handleUploadStream);
 	
@@ -1775,7 +1870,7 @@ void loop() {
 	if (rebootPressedTime > 0 && (long)(millis() - rebootPressedTime) >= 0) {
 		reboot();
 	}
-	
+
 	wifi.tick();
 
 	if (!wifi.ready()) {

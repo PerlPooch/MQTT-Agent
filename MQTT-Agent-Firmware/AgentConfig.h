@@ -7,6 +7,7 @@ struct AppConfig {
 	uint16_t MQTTPort = 1883;
 	uint16_t temperatureUpdateRate = 10;
 	uint16_t statusUpdateRate = 60;
+	uint16_t relayPulseDuration = 500;
 };
 
 // Application schema and recovery policy; storage and validation belong to MDS_Config.
@@ -39,7 +40,7 @@ public:
 	}
 
 private:
-	// Read the four settings from MDS_Config and copy them into AppConfig for MQTT-Agent.
+	// Read the managed settings from MDS_Config and copy them into AppConfig for MQTT-Agent.
 	void copyConfigValuesToAppConfig();
 
 	MDS_Config storage_;

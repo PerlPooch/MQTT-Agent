@@ -11,11 +11,12 @@ namespace {
 		{"MQTTBroker",				Type::Text,		Access::ReadWrite,	true, "",		0,		0,	63},
 		{"MQTTPort",				Type::Unsigned, Access::ReadWrite,	true, nullptr,	1883,	1,	65535},
 		{"temperatureUpdateRate",	Type::Unsigned, Access::ReadWrite,	true, nullptr,	10,		0,	65535},
-		{"statusUpdateRate",		Type::Unsigned, Access::ReadWrite,	true, nullptr,	60,		0,	65535}
+		{"statusUpdateRate",		Type::Unsigned, Access::ReadWrite,	true, nullptr,	60,		0,	65535},
+		{"relayPulseDuration",		Type::Unsigned, Access::ReadWrite,	true, nullptr,	500,	100,	60000}
 	};
 }
 
-// Read the four settings from MDS_Config and copy them into AppConfig for MQTT-Agent.
+// Read the managed settings from MDS_Config and copy them into AppConfig for MQTT-Agent.
 void AgentConfig::copyConfigValuesToAppConfig() {
 	const char* broker = storage_.get("MQTTBroker").as<const char*>();
 	memcpy(values_.MQTTBroker, broker, strlen(broker) + 1);
@@ -23,6 +24,7 @@ void AgentConfig::copyConfigValuesToAppConfig() {
 	values_.MQTTPort = storage_.get("MQTTPort").as<uint16_t>();
 	values_.temperatureUpdateRate = storage_.get("temperatureUpdateRate").as<uint16_t>();
 	values_.statusUpdateRate = storage_.get("statusUpdateRate").as<uint16_t>();
+	values_.relayPulseDuration = storage_.get("relayPulseDuration").as<uint16_t>();
 }
 
 // Load configuration, discarding an unreadable file and any interrupted write.
