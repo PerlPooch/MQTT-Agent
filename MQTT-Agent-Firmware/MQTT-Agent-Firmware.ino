@@ -10,14 +10,14 @@
 // STATUS_1 and DFPlayer are mutually exclusive
 #define USE_STATUS_1
 #define INVERT_STATUS
-// #define USE_RELAY_0
+#define USE_RELAY_0
 // RELAY_1 and DFPlayer are mutually exclusive
-// #define USE_RELAY_1
+#define USE_RELAY_1
 // #define USE_DFPLAYER
 // #define PLAY_TRIGGER_RELAY_0
 // #define USE_MIDI
-#define RELAY_POSITIVE_LOGIC
-// #define RELAY_NEGATIVE_LOGIC
+// #define RELAY_POSITIVE_LOGIC
+#define RELAY_NEGATIVE_LOGIC
 #define USE_1WIRE_TEMPERATURE
 // #define USE_DHT11_TEMPERATURE
 // #define ROTATE_DISPLAY
@@ -55,7 +55,7 @@
 #endif
 
 
-#define VERSION				"2.2"
+#define VERSION				"2.3"
 
 // #define DEBUG_D						// Mirror screen to serial
 
@@ -375,7 +375,7 @@ static void savePortalConfig() {
 	}
 }
 
-// Populate the portal fields and start the library's existing connection/provisioning policy.
+// Populate portal fields and retry saved Wi-Fi in the background until the AP returns.
 static void setupWiFi(bool forcePortal) {
 	snprintf(portalMqttPort, sizeof(portalMqttPort), "%u", (unsigned)appConfig.MQTTPort);
 	snprintf(portalTemperatureRate, sizeof(portalTemperatureRate), "%u", (unsigned)appConfig.temperatureUpdateRate);
@@ -398,7 +398,7 @@ static void setupWiFi(bool forcePortal) {
 	options.accessPointPrefix = "MQA";
 	options.accessPointPassword = "12345678";
 	options.portalTitle = "Agent Configuration";
-	options.connectionPolicy = MDS_WiFi::ConnectionPolicy::Legacy;
+	options.connectionPolicy = MDS_WiFi::ConnectionPolicy::RetrySavedNetwork;
 
 	wifi.begin(options, forcePortal);
 }
@@ -1706,7 +1706,7 @@ owInventory();
 
 // ----------- WiFi -----------------------------------------------------------
 
-	// Register all application routes before Wi-Fi startup can return early.
+	// Register all application routes before starting Wi-Fi.
 	http.server().on("/", rootPage);
 	http.server().on("/upload", HTTP_GET, handleUploadPage);
 	http.server().on("/upload", HTTP_POST, handleUploadPost, handleUploadStream);
@@ -1715,16 +1715,11 @@ owInventory();
 	setupWiFi(is_reset == LOW);
 	wifiWasReady = wifi.ready();
 
-	if (!wifiWasReady) {
-		return;
+	if (wifiWasReady) {
+		http.begin();
 	}
 
-	http.begin();
-
-	// Bail out of rest of setup if reset held
-	if (is_reset == LOW)
-		return;
-	
+	// Finish initializing local hardware even while the saved network is unavailable.
 #ifdef USE_DFPLAYER
 	Serial.println(F("DFP: Setup."));
 	setupDFP();
@@ -1735,10 +1730,14 @@ owInventory();
 	midiA.begin(1);	// Launch MIDI and listen to channel 1
 #endif
    
-	if(strlen(appConfig.MQTTBroker) > 0) {
-		mqttConnect();
-
-		mqttSubscribe();
+	if (strlen(appConfig.MQTTBroker) > 0) {
+		if (wifiWasReady) {
+			mqttConnect();
+			mqttSubscribe();
+		} else {
+			D(F("MQTT: Waiting for WiFi."));
+			Serial.println(F("MQTT: Waiting for WiFi."));
+		}
 	} else {
 		D(F("MQTT: Unconfigured."));
 		Serial.println(F("MQTT: Unconfigured.\n"));
@@ -1778,11 +1777,6 @@ void loop() {
 	}
 	
 	wifi.tick();
-
-	// The library requests the Legacy no-SSID reboot; the application performs it.
-	if (wifi.rebootRequested()) {
-		rebootTime = 0;
-	}
 
 	if (!wifi.ready()) {
 		http.stop();
