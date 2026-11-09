@@ -30,7 +30,6 @@
 #elif IS_ESP32
 	#include <WiFi.h>
 #endif
-#include <Update.h>
 #include <ArduinoJson.h>
 #include <PubSubClient.h>
 #ifdef USE_1WIRE_TEMPERATURE
@@ -149,7 +148,7 @@ MDS_WiFi wifi;
 // Borrow the library's stable MAC-based identity for MQTT topics and payloads.
 const char* const systemID = wifi.systemID();
 
-MDS_HTTP http;
+MDS_HTTP http(MDS_HTTP::Options{MDS_HTTP::UploadMode::Enabled});
 
 #ifdef USE_1WIRE_TEMPERATURE
 OneWire 			oneWire(PIN_TEMP_0);
@@ -218,10 +217,6 @@ static volatile bool shouldReboot = false;
 
 // === Display
 void D(const String& message);
-
-static void handleUploadPage();
-static void handleUploadPost();
-static void handleUploadStream();
 
 // Application-owned provisioning fields; MDS_WiFi owns WiFiManager.
 static char portalMqttPort[6];     // "65535" + NUL
@@ -479,100 +474,6 @@ static void setupWiFi(MDS_WiFi::StartupMode mode) {
 
 	wifi.begin(options, mode);
 }
-
-// Serve the existing browser form for uploading a firmware binary.
-static void handleUploadPage()
-{
-	if (!wifi.ready()) {
-		return;
-	}
-
-	// Minimal page: choose .bin and POST it
-	static const char uploadHtml[] =
-		"<!doctype html><html><head><meta charset='utf-8'>"
-		"<meta name='viewport' content='width=device-width,initial-scale=1'>"
-		"<title>Update Firmware</title>"
-		"<style>"
-		":root{--bg:#000000;--text:#fff;--card:#20202080;--border:rgba(43,14,161,0.58);--shadow:0 12px 30px rgba(0,0,0,.10);--radius:8px}"
-		"html,body{height:100%;}"
-		"body{margin:0;color:var(--text);background:var(--bg);font-family:Helvetica,Arial,sans-serif;}"
-		".card{max-width:560px;margin:10vh auto;padding:24px;background:var(--card);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);}"
-		".row{display:flex;gap:8px;align-items:center;}"
-		".row button{margin-left:auto;}"
-		"h3{margin:0 0 14px 0;font-size:18px;font-weight:600;}"
-		"input,button{font:inherit;}"
-		"button{margin-left:8px;border-radius:var(--radius);background:#fff;cursor:pointer;}"
-		"</style>"
-		"</head><body>"
-		"<div class='card'>"
-		"<h3>Update Firmware</h3>"
-		"<form method='POST' action='/upload' enctype='multipart/form-data'>"
-		"<div class='row'>"
-		"<input type='file' name='firmware' accept='.bin' required>"
-		"<button type='submit'>Update</button>"
-		"</div>"
-		"</form>"
-		"</div>"
-		"</body></html>";
-
-	http.server().send(200, "text/html", uploadHtml);
-}
-
-static void handleUploadPost()
-{
-	// Called after upload completes (success or failure)
-	if (Update.hasError()) {
-		String msg = "Update failed.\n";
-		http.server().send(500, "text/plain", msg);
-		return;
-	}
-
-	http.server().send(200, "text/plain", "Update OK. Rebooting...\n");
-	shouldReboot = true; // reboot in loop after response is sent
-}
-
-// Write incoming firmware chunks and finalize or abort the update.
-static void handleUploadStream()
-{
-	HTTPUpload &upload = http.server().upload();
-
-	if (upload.status == UPLOAD_FILE_START) {
-		Serial.printf("OTA: Start: %s\n", upload.filename.c_str());
-		D(F("OTA: Start ..."));
-
-		// Optional: stop other activity if you want (MQTT, timers, etc.)
-		// client.disconnect();
-
-		if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
-			Serial.println("OTA: Update.begin() failed");
-			D(F("OTA: failed."));
-			Update.printError(Serial);
-		}
-
-	} else if (upload.status == UPLOAD_FILE_WRITE) {
-		if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-			Serial.println("OTA: Update.write() failed");
-			D(F("OTA: failed."));
-			Update.printError(Serial);
-		}
-
-	} else if (upload.status == UPLOAD_FILE_END) {
-		if (Update.end(true)) {
-			Serial.printf("OTA: Success. Size: %u\n", upload.totalSize);
-			D(F("OTA: Success."));
-		} else {
-			Serial.println("OTA: Update.end() failed");
-			D(F("OTA: failed."));
-			Update.printError(Serial);
-		}
-
-	} else if (upload.status == UPLOAD_FILE_ABORTED) {
-		Serial.println("OTA: Upload aborted");
-		D(F("OTA: aborted."));
-		Update.end();
-	}
-}
-
 
 void owAddressToCString(const uint8_t addr[8], char *out)
 {
@@ -1815,8 +1716,15 @@ owInventory();
 	// Register all application routes before starting Wi-Fi.
 	http.server().on("/", rootPage);
 	http.server().on("/ui", uiPage);
-	http.server().on("/upload", HTTP_GET, handleUploadPage);
-	http.server().on("/upload", HTTP_POST, handleUploadPost, handleUploadStream);
+	http.setStatusCallback([](const String& message) {
+		// Keep upload diagnostics in the application's Serial and OLED outputs.
+		Serial.println(message);
+		D(message);
+	});
+	http.setUploadCompleteCallback([]() {
+		// Reboot from loop() after the successful upload response has been sent.
+		shouldReboot = true;
+	});
 	
 	// Holding reset at boot clears saved credentials and forces the configuration portal.
 	using StartupMode = MDS_WiFi::StartupMode;
