@@ -437,7 +437,7 @@ static void savePortalConfig() {
 }
 
 // Populate portal fields and retry saved Wi-Fi in the background until the AP returns.
-static void setupWiFi(bool forcePortal) {
+static void setupWiFi(MDS_WiFi::StartupMode mode) {
 	snprintf(portalMqttPort, sizeof(portalMqttPort), "%u", (unsigned)appConfig.MQTTPort);
 	snprintf(portalTemperatureRate, sizeof(portalTemperatureRate), "%u", (unsigned)appConfig.temperatureUpdateRate);
 	snprintf(portalStatusRate, sizeof(portalStatusRate), "%u", (unsigned)appConfig.statusUpdateRate);
@@ -465,7 +465,7 @@ static void setupWiFi(bool forcePortal) {
 	options.portalTitle = "Agent Configuration";
 	options.connectionPolicy = MDS_WiFi::ConnectionPolicy::RetrySavedNetwork;
 
-	wifi.begin(options, forcePortal);
+	wifi.begin(options, mode);
 }
 
 // Serve the existing browser form for uploading a firmware binary.
@@ -1488,7 +1488,7 @@ void D(const String& message) {
 // Initialize the board's I2C bus and OLED; welcome() reports failure once Serial is ready.
 void setupDisplay() {
 	Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
-	display.setup();
+	display.begin();
 }
 
 
@@ -1807,7 +1807,8 @@ owInventory();
 	http.server().on("/upload", HTTP_POST, handleUploadPost, handleUploadStream);
 	
 	// Holding reset at boot clears saved credentials and forces the configuration portal.
-	setupWiFi(is_reset == LOW);
+	using StartupMode = MDS_WiFi::StartupMode;
+	setupWiFi(is_reset == LOW ? StartupMode::ResetCredentialsAndProvision : StartupMode::Normal);
 	wifiWasReady = wifi.ready();
 
 	if (wifiWasReady) {

@@ -29,7 +29,7 @@ void AgentConfig::copyConfigValuesToAppConfig() {
 
 // Load configuration, discarding an unreadable file and any interrupted write.
 bool AgentConfig::begin() {
-	if (!storage_.setSettings(Settings) || !storage_.setup(true)) {
+	if (!storage_.setSettings(Settings) || !storage_.begin(MDS_Config::FormatPolicy::OnMountFailure)) {
 		error_ = storage_.lastError();
 		return false;
 	}
